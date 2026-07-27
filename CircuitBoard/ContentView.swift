@@ -3,21 +3,24 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var model = BoardModel()
     @StateObject private var stats = FrameStats()
+    @State private var showTitle: Bool = false
 
     var body: some View {
         ZStack(alignment: .bottom) {
+            if showTitle {
+                VStack {
+                    Text("Hello Wordl!")
+                        .font(.system(size: 100, weight: .bold, design: .rounded))
+                        .shadow(radius: 1)
+                        .foregroundStyle(Color.white)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(1)
+            }
             BoardView(params: model.params, options: model.renderOptions, stats: stats)
                 .ignoresSafeArea()
-
-            if model.chromeHidden {
-                // Leave a way back — hiding the bar must not hide its own switch.
-                Button("⛶") { model.chromeHidden = false }
-                    .buttonStyle(PCBButton())
-                    .padding(.bottom, 20)
-            } else {
                 controls
                     .padding(.bottom, 16)
-            }
         }
         .overlay(alignment: .topTrailing) {
             if model.showStats {
@@ -32,51 +35,70 @@ struct ContentView: View {
 
     private var controls: some View {
         VStack(spacing: 10) {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)],
-                      spacing: 8) {
-                Button(fullScreenLabel) { model.toggleFullScreen() }
+            if model.chromeHidden  {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 140), spacing: 10)],
+                          spacing: 8) {
+                    Button("⟳ New board") { model.newBoard() }
+                        .buttonStyle(PCBButton())
+                    Button(model.teardrops ? "◗ Cone: on" : "◗ Cone: off") {
+                        model.teardrops.toggle()
+                    }
                     .buttonStyle(PCBButton())
-                Button("⟳ New board") { model.newBoard() }
+                    Button(model.glow ? "✷ Glow: on" : "✷ Glow: off") {
+                        model.glow.toggle()
+                    }
                     .buttonStyle(PCBButton())
-                Button(model.teardrops ? "◗ Cone: on" : "◗ Cone: off") {
-                    model.teardrops.toggle()
+                    Button("◐ \(model.scheme.label)") {
+                        model.scheme = model.scheme.next
+                    }
+                    .buttonStyle(PCBButton())
+                    Button(model.tilted ? "◈ 3D: on" : "◈ 3D: off") {
+                        model.tilted.toggle()
+                    }
+                    .buttonStyle(PCBButton())
+                    Button(model.backgroundPads ? "◎ Deep pads: on" : "◎ Deep pads: off") {
+                        model.backgroundPads.toggle()
+                    }
+                    .buttonStyle(PCBButton())
+                    Button(model.showStats ? "◱ Hide stats" : "◱ Stats") {
+                        model.showStats.toggle()
+                        stats.reset()
+                    }
+                    .buttonStyle(PCBButton())
                 }
-                .buttonStyle(PCBButton())
-                Button(model.glow ? "✷ Glow: on" : "✷ Glow: off") {
-                    model.glow.toggle()
+                .frame(maxWidth: 620)
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 14)],
+                          spacing: 8) {
+                    slider(Sliders.traces, $model.traces)
+                    slider(Sliders.groups, $model.groups)
+                    slider(Sliders.hug, $model.hug)
+                    slider(Sliders.rails, $model.rails)
+                    slider(Sliders.parts, $model.parts)
+                    slider(Sliders.nums, $model.nums)
                 }
-                .buttonStyle(PCBButton())
-                Button("◐ \(model.scheme.label)") {
-                    model.scheme = model.scheme.next
-                }
-                .buttonStyle(PCBButton())
-                Button(model.tilted ? "◈ 3D: on" : "◈ 3D: off") {
-                    model.tilted.toggle()
-                }
-                .buttonStyle(PCBButton())
-                Button(model.backgroundPads ? "◎ Deep pads: on" : "◎ Deep pads: off") {
-                    model.backgroundPads.toggle()
-                }
-                .buttonStyle(PCBButton())
-                Button(model.showStats ? "◱ Hide stats" : "◱ Stats") {
-                    model.showStats.toggle()
-                    stats.reset()
-                }
-                .buttonStyle(PCBButton())
+                          .frame(maxWidth: 620)
             }
-            .frame(maxWidth: 620)
 
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 132), spacing: 14)],
-                      spacing: 8) {
-                slider(Sliders.traces, $model.traces)
-                slider(Sliders.groups, $model.groups)
-                slider(Sliders.hug, $model.hug)
-                slider(Sliders.rails, $model.rails)
-                slider(Sliders.parts, $model.parts)
-                slider(Sliders.nums, $model.nums)
-            }
-            .frame(maxWidth: 620)
         }
+        .frame(width: 620)
+        .frame(
+            minHeight: model.chromeHidden ? nil : 20,
+            maxHeight: model.chromeHidden ? 220 : 20
+        )
+        .overlay(alignment:  model.chromeHidden ? .bottom : .center, content: {
+            HStack {
+                Button("⛶") { model.chromeHidden.toggle()}
+                    .buttonStyle(PCBButton())
+                    .padding(10)
+                Button{
+                    showTitle.toggle()
+                } label: {
+                    Image(systemName:  showTitle ? "eye" : "eye.slash")
+                }
+                    .buttonStyle(PCBButton())
+                    .padding(10)
+            }
+        })
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         // A flat fill, NOT `.ultraThinMaterial`. A material samples and blurs
