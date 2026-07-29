@@ -16,7 +16,11 @@ final class RoutingGrid {
     let rows: Int
     let count: Int
 
-    private let occStore: UnsafeMutableBufferPointer<UInt8>
+    /// One bit per cell instead of one byte. `occ` and `hug` together were
+    /// 32.8 KB against a 64 KB L1, competing with A*'s 345 KB of per-cell
+    /// state; this takes the pair to 18.5 KB.
+    private let occWords: UnsafeMutablePointer<UInt64>
+    private let wordCount: Int
     private let hugStore: UnsafeMutableBufferPointer<UInt8>
 
     /// Bumped by every change `blocked` can see — occupancy and the hug field
@@ -44,10 +48,11 @@ final class RoutingGrid {
         self.cols = cols
         self.rows = rows
         count = cols * rows
-        occStore = .allocate(capacity: count)
+        wordCount = (count + 63) / 64
+        occWords = .allocate(capacity: wordCount)
         hugStore = .allocate(capacity: count)
         repairStamp = .allocate(capacity: count)
-        occStore.initialize(repeating: 0)
+        occWords.initialize(repeating: 0, count: wordCount)
         hugStore.initialize(repeating: 0)
         repairStamp.initialize(repeating: 0)
         pendingSources.reserveCapacity(1024)
@@ -56,13 +61,22 @@ final class RoutingGrid {
     }
 
     deinit {
-        occStore.deallocate()
+        occWords.deallocate()
         hugStore.deallocate()
         repairStamp.deallocate()
     }
 
-    var occ: UnsafeMutableBufferPointer<UInt8> { occStore }
     var hug: UnsafeMutableBufferPointer<UInt8> { hugStore }
+
+    @inline(__always) func isSet(_ i: Int) -> Bool {
+        occWords[i >> 6] & (1 << UInt64(i & 63)) != 0
+    }
+    @inline(__always) private func set(_ i: Int) {
+        occWords[i >> 6] |= 1 << UInt64(i & 63)
+    }
+    @inline(__always) private func unset(_ i: Int) {
+        occWords[i >> 6] &= ~(1 << UInt64(i & 63))
+    }
 
     @inline(__always) func index(_ x: Int, _ y: Int) -> Int { y * cols + x }
     @inline(__always) func inBounds(_ x: Int, _ y: Int) -> Bool {
@@ -71,7 +85,7 @@ final class RoutingGrid {
 
     func clear() {
         version &+= 1
-        occStore.update(repeating: 0)
+        occWords.update(repeating: 0, count: wordCount)
         hugStore.update(repeating: 0)
         pendingSources.removeAll(keepingCapacity: true)
     }
@@ -83,7 +97,7 @@ final class RoutingGrid {
         if x0 < 0 || y0 < 0 || x1 >= cols || y1 >= rows { return false }
         for y in y0...y1 {
             let row = y * cols
-            for x in x0...x1 where occStore[row + x] != 0 { return false }
+            for x in x0...x1 where isSet(row + x) { return false }
         }
         return true
     }
@@ -97,8 +111,8 @@ final class RoutingGrid {
             let row = y * cols
             for x in lx...hx {
                 let i = row + x
-                if occStore[i] == 0 {
-                    occStore[i] = 1
+                if !isSet(i) {
+                    set(i)
                     pendingSources.append(Int32(i))
                 }
                 hugStore[i] = 0
@@ -118,7 +132,7 @@ final class RoutingGrid {
         guard ly <= hy, lx <= hx else { return false }
         for ay in ly...hy {
             let row = ay * cols
-            for ax in lx...hx where occStore[row + ax] != 0 { return true }
+            for ax in lx...hx where isSet(row + ax) { return true }
         }
         return false
     }
@@ -133,9 +147,9 @@ final class RoutingGrid {
     /// it.
     @discardableResult
     func reserve(_ i: Int) -> Bool {
-        guard occStore[i] == 0 else { return false }
+        guard !isSet(i) else { return false }
         version &+= 1
-        occStore[i] = 1
+        set(i)
         return true
     }
 
@@ -164,7 +178,7 @@ final class RoutingGrid {
 
         var x0 = cols, y0 = rows, x1 = -1, y1 = -1
         for i in cells {
-            occStore[i] = 0
+            unset(i)
             let x = i % cols, y = i / cols
             x0 = min(x0, x); x1 = max(x1, x)
             y0 = min(y0, y); y1 = max(y1, y)
@@ -188,7 +202,7 @@ final class RoutingGrid {
         frontier.removeAll(keepingCapacity: true)
         for y in sy0...sy1 {
             let row = y * cols
-            for x in sx0...sx1 where occStore[row + x] != 0 {
+            for x in sx0...sx1 where isSet(row + x) {
                 repairStamp[row + x] = gen
                 frontier.append(Int32(row + x))
             }
@@ -211,7 +225,7 @@ final class RoutingGrid {
                         // Copper is a source, never a step: a cell whose line to
                         // the nearest copper crosses other copper is nearer to
                         // that one instead, so stopping here changes no answer.
-                        if occStore[j] != 0 { continue }
+                        if isSet(j) { continue }
                         if repairStamp[j] == gen { continue }
                         repairStamp[j] = gen
                         if nx >= dx0, nx <= dx1, ny >= dy0, ny <= dy1 { hugStore[j] = l }
@@ -229,7 +243,7 @@ final class RoutingGrid {
     /// follow with `rebuildHug()` rather than the incremental settle.
     func release(_ i: Int) {
         version &+= 1
-        occStore[i] = 0
+        unset(i)
     }
 
     /// `blocked` for a caller that already holds the linear index. The
@@ -237,8 +251,8 @@ final class RoutingGrid {
     /// reachability pass makes eight of them per cell.
     @inline(__always)
     func blockedAt(_ i: Int, _ r: Int) -> Bool {
-        if r == 0 { return occStore[i] == 1 }
-        if r == 1 { return occStore[i] != 0 || hugStore[i] == 1 }
+        if r == 0 { return isSet(i) }
+        if r == 1 { return isSet(i) || hugStore[i] == 1 }
         return blocked(i % cols, i / cols, r)
     }
 
@@ -250,19 +264,19 @@ final class RoutingGrid {
     @inline(__always)
     func blocked(_ x: Int, _ y: Int, _ r: Int) -> Bool {
         let i = index(x, y)
-        if r == 0 { return occStore[i] == 1 }
+        if r == 0 { return isSet(i) }
         // `hug` is already the Chebyshev distance to the nearest copper, capped
         // at hugRadius and zero on copper itself — so "is there copper within
         // one cell" is exactly "occupied, or hug says the nearest is one away".
         // One load instead of a 3×3 scan, in A*'s innermost loop, and exact
         // rather than an approximation. Guarded by a test against the scan.
-        if r == 1 { return occStore[i] != 0 || hugStore[i] == 1 }
+        if r == 1 { return isSet(i) || hugStore[i] == 1 }
         let ly = max(0, y - r), hy = min(rows - 1, y + r)
         let lx = max(0, x - r), hx = min(cols - 1, x + r)
         guard ly <= hy, lx <= hx else { return false }
         for ay in ly...hy {
             let row = ay * cols
-            for ax in lx...hx where occStore[row + ax] != 0 { return true }
+            for ax in lx...hx where isSet(row + ax) { return true }
         }
         return false
     }
@@ -300,7 +314,7 @@ final class RoutingGrid {
                         let nx = x + dx
                         if nx < 0 || nx >= cols { continue }
                         let j = row + nx
-                        if occStore[j] != 0 { continue }
+                        if isSet(j) { continue }
                         if hugStore[j] != 0 && hugStore[j] <= l { continue }
                         hugStore[j] = l
                         nextFrontier.append(Int32(j))
@@ -320,7 +334,7 @@ final class RoutingGrid {
         hugStore.update(repeating: 0)
         pendingSources.removeAll(keepingCapacity: true)
         frontier.removeAll(keepingCapacity: true)
-        for i in 0..<count where occStore[i] != 0 { frontier.append(Int32(i)) }
+        for i in 0..<count where isSet(i) { frontier.append(Int32(i)) }
         for level in 1...Routing.hugRadius {
             nextFrontier.removeAll(keepingCapacity: true)
             let l = UInt8(level)
@@ -334,7 +348,7 @@ final class RoutingGrid {
                         let nx = x + dx
                         if nx < 0 || nx >= cols { continue }
                         let j = row + nx
-                        if occStore[j] != 0 || hugStore[j] != 0 { continue }
+                        if isSet(j) || hugStore[j] != 0 { continue }
                         hugStore[j] = l
                         nextFrontier.append(Int32(j))
                     }
