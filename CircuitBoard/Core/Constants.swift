@@ -85,6 +85,16 @@ enum Routing {
     static let diagonalExtra: Float = 0.4142
     static let diagonalStep: Float = 1.4142
 
+    /// Cells of path a new step is checked against for a reversal, inside the
+    /// search. Every expansion pays for this one, so it is kept to the narrowest
+    /// that leaves no wedge A* can draw on its own.
+    static let spikeWindow = 5
+
+    /// The same test at a stub, where it runs once per finished route instead of
+    /// once per node — so it can afford the whole ~64 px over which a
+    /// doubling-back still reads as one place.
+    static let stubWindow = 8
+
     /// Attempts before a placement or routing helper gives up.
     static let freeCellTries = 80
     static let padTraceTries = 10

@@ -122,7 +122,7 @@ extension TileGenerator {
         // line — about five cells — not just at the final step.
         var arc: Float = 0
         var i = path.count - 1
-        while i > 0, arc < 5 {
+        while i > 0, arc < Float(Routing.stubWindow) {
             let v = SIMD2<Float>(Float(path[i].x - path[i-1].x), Float(path[i].y - path[i-1].y))
             let l = (v.x * v.x + v.y * v.y).squareRoot()
             arc += l
@@ -137,13 +137,14 @@ extension TileGenerator {
     /// route as before; only the rest pay for a second look.
     func routeToPad(from start: SIMD2<Int32>, pad: Int, keepout r: Int,
                     via: (SIMD2<Int32>) -> [SIMD2<Int32>]?) -> (path: [SIMD2<Int32>], port: SIMD2<Int32>)? {
-        var fallback: (path: [SIMD2<Int32>], port: SIMD2<Int32>)?
         for q in padPorts(pad, keepout: r, toward: start) {
             guard let path = via(q) else { continue }
             if !stubDoublesBack(path, port: q, pad: pad) { return (path, q) }
-            if fallback == nil { fallback = (path, q) }
         }
-        return fallback
+        // Every port would leave a stub doubling back over the route. Refuse the
+        // pad rather than draw the wedge — the caller has nine more to try, and
+        // a trace that does not exist is better than one that looks broken.
+        return nil
     }
 
     func markPads(_ indices: [Int]) {

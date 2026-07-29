@@ -109,11 +109,29 @@ extension TileGenerator {
             }
             lead.append(c)
         }
+        // Straight in, so the router knows the line is already travelling that
+        // way and will not turn back on it.
+        let heading = port.row == 0 ? 2 : 6          // (0, +1) / (0, -1)
         if ok, let last = lead.last,
-           let p = router.route(from: last, to: target, keepout: r) {
+           let p = router.route(from: last, to: target, keepout: r, heading: heading),
+           !returnsToSeam(p, row: port.row) {
             return lead.dropLast() + p
         }
-        return router.route(from: a, to: target, keepout: r)
+        // Unconstrained fallback, but never one that turns straight back at the
+        // boundary: the stub from the edge to the first cell is drawn too, and a
+        // route returning to that row within a few cells puts a wedge on it.
+        guard let p = router.route(from: a, to: target, keepout: r),
+              !returnsToSeam(p, row: port.row) else { return nil }
+        return p
+    }
+
+    /// Does the path come back to the seam row while the eye still reads it as
+    /// the same place?
+    private func returnsToSeam(_ path: [SIMD2<Int32>], row: Int) -> Bool {
+        for c in path.dropFirst().prefix(Routing.stubWindow) where Int(c.y) == row {
+            return true
+        }
+        return false
     }
 
     /// Every seam port is its own net, ending at a pad inside this tile.
@@ -183,9 +201,13 @@ extension TileGenerator {
             let padIndex = data.pads.count - 1
             grid.settleHug()
 
-            guard let b = padPort(padIndex, keepout: r,
-                                  toward: SIMD2(Int32(port.gx), Int32(port.row))) else { continue }
-            guard let path = routeFromSeam(port, to: b, keepout: r) else { continue }
+            // Same rule as everywhere else: the via's own stub is drawn, so it
+            // has to carry on the way the route arrived.
+            guard let hit = routeToPad(from: SIMD2(Int32(port.gx), Int32(port.row)),
+                                       pad: padIndex, keepout: r, via: {
+                routeFromSeam(port, to: $0, keepout: r)
+            }) else { continue }
+            let path = hit.path
             grid.claim(path, width: w)
             data.pads[padIndex].taken = true
             return Trace(path: path, color: color, width: w, cls: port.cls,

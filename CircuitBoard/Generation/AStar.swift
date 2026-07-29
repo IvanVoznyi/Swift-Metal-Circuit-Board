@@ -16,6 +16,11 @@ final class Router {
     private let gScore: UnsafeMutableBufferPointer<Float>
     private let cameFrom: UnsafeMutableBufferPointer<Int32>
     private let dirOf: UnsafeMutableBufferPointer<Int8>
+    /// The last `Routing.spikeWindow` directions of the path reaching each cell,
+    /// one nibble each, newest in the low bits, 0xF for "no history". Six
+    /// dependent loads down the `cameFrom` chain per neighbour cost 70% of a
+    /// tile; this is one load per pop and one AND per neighbour.
+    private let recentDirs: UnsafeMutableBufferPointer<UInt32>
     private let visitStamp: UnsafeMutableBufferPointer<UInt32>
     private let closedStamp: UnsafeMutableBufferPointer<UInt32>
     private var generation: UInt32 = 0
@@ -57,6 +62,7 @@ final class Router {
         gScore = .allocate(capacity: count)
         cameFrom = .allocate(capacity: count)
         dirOf = .allocate(capacity: count)
+        recentDirs = .allocate(capacity: count)
         visitStamp = .allocate(capacity: count)
         closedStamp = .allocate(capacity: count)
         reachStamp = .allocate(capacity: count)
@@ -65,6 +71,7 @@ final class Router {
         gScore.initialize(repeating: .infinity)
         cameFrom.initialize(repeating: -1)
         dirOf.initialize(repeating: -1)
+        recentDirs.initialize(repeating: Router.noHistory)
         visitStamp.initialize(repeating: 0)
         closedStamp.initialize(repeating: 0)
         reachStamp.initialize(repeating: 0)
@@ -84,6 +91,7 @@ final class Router {
         gScore.deallocate()
         cameFrom.deallocate()
         dirOf.deallocate()
+        recentDirs.deallocate()
         visitStamp.deallocate()
         closedStamp.deallocate()
         reachStamp.deallocate()
@@ -161,6 +169,46 @@ final class Router {
             i = m
         }
         return top
+    }
+
+    /// Every nibble a sentinel: a path with nothing behind it yet.
+    static let historyMask: UInt32 = (1 << UInt32(4 * Routing.spikeWindow)) - 1
+    static let noHistory: UInt32 = Router.historyMask
+
+    /// Directions that would turn 135 degrees or more away from `d`, as a bit
+    /// per direction. Built once so the innermost loop tests a mask instead of
+    /// walking anything.
+    static let opposed: [UInt32] = (0..<8).map { d in
+        var m: UInt32 = 0
+        for k in 3...5 { m |= 1 << UInt32((d + k) & 7) }
+        return m
+    }
+
+    /// Turn magnitude between two of the eight directions, in 45 degree steps.
+    @inline(__always) static func turnSteps(_ a: Int, _ b: Int) -> Int {
+        let raw = abs(a - b)
+        return raw > 4 ? 8 - raw : raw
+    }
+
+    /// Directions that would double the line back on itself, given where it has
+    /// been for the last few cells.
+    ///
+    /// The window is what the eye reads as one place — six cells, the ~44 px a
+    /// wedge spans before it stops looking like a kink and starts looking like a
+    /// turn. A drawn segment is a whole run of same-direction cells, so two
+    /// vertices of the drawn line can be five cells apart; a shorter window
+    /// misses exactly the shape this is here to forbid, and a wider one starts
+    /// refusing honest detours.
+    @inline(__always)
+    private func forbiddenDirections(_ history: UInt32) -> UInt32 {
+        var h = history
+        var mask: UInt32 = 0
+        for _ in 0..<Routing.spikeWindow {
+            let d = h & 0xF
+            if d != 0xF { mask |= Router.opposed[Int(d)] }
+            h >>= 4
+        }
+        return mask
     }
 
     // MARK: - Reachability
@@ -299,7 +347,13 @@ final class Router {
 
     /// Returns the centreline in grid cells, or nil if no legal corridor of
     /// keepout `r` exists inside the search budget.
-    func route(from s: SIMD2<Int32>, to e: SIMD2<Int32>, keepout r: Int) -> [SIMD2<Int32>]? {
+    /// `heading` is the direction the line was already travelling when it
+    /// reached `s` — for a path whose first cells were laid down by the caller.
+    /// Without it the search starts with no history and is free to reverse on
+    /// its very first step, which is exactly the wedge the rest of this guards
+    /// against.
+    func route(from s: SIMD2<Int32>, to e: SIMD2<Int32>, keepout r: Int,
+               heading: Int = -1) -> [SIMD2<Int32>]? {
         let cols = grid.cols, rows = grid.rows
         let start = Int(s.y) * cols + Int(s.x)
         let goal = Int(e.y) * cols + Int(e.x)
@@ -332,7 +386,9 @@ final class Router {
         gScore[start] = 0
         visitStamp[start] = gen
         cameFrom[start] = -1
-        dirOf[start] = -1
+        dirOf[start] = Int8(heading)
+        recentDirs[start] = heading >= 0 ? (Router.noHistory << 4 | UInt32(heading)) & Router.historyMask
+                                         : Router.noHistory
         heapPush(heuristic(Int(s.x), Int(s.y)), Int32(start))
 
         var pops = 0
@@ -350,6 +406,8 @@ final class Router {
             let cx = cur % cols, cy = cur / cols
             let cd = Int(dirOf[cur])
             let curG = gScore[cur]
+            let history = recentDirs[cur]
+            let forbidden = forbiddenDirections(history)
 
             for di in 0..<8 {
                 let dx = Router.dx(di), dy = Router.dy(di)
@@ -368,15 +426,27 @@ final class Router {
                 if dx != 0 && dy != 0 {
                     if grid.blocked(cx + dx, cy, r) || grid.blocked(cx, cy + dy, r) { continue }
                 }
-                let step: Float = (dx != 0 && dy != 0) ? Routing.diagonalStep : 1
-                let lane = lane(hug[ni])
+                // No spike: never leave more than 90 degrees off the way the
+                // line arrived, and never off the way it was going two or three
+                // cells back either. A single 135 degree vertex and a pair of
+                // 90s over five cells draw the same thing — a wedge with the
+                // line doubling back beside itself — and the turn cost alone
+                // only prices those, it does not forbid them. A wide U-turn is
+                // untouched: this looks back three cells, not thirty.
+                // No spike: never leave more than 90 degrees off the way the
+                // line arrived, nor off the way it was going a few cells back.
+                // A single 135 degree vertex and a pair of 90s over five cells
+                // draw the same thing — a wedge with the line doubling back
+                // beside itself — and the turn cost alone only prices those.
+                if forbidden & (1 << UInt32(di)) != 0 { continue }
                 var turn: Float = 0
                 if cd >= 0 {
-                    let raw = abs(di - cd)
-                    let dd = raw > 4 ? 8 - raw : raw
+                    let dd = Router.turnSteps(di, cd)
                     turn = dd == 0 ? 0 : (dd == 1 ? Routing.turn45
                                                   : Routing.turn90 * Float(dd) * 0.5)
                 }
+                let step: Float = (dx != 0 && dy != 0) ? Routing.diagonalStep : 1
+                let lane = lane(hug[ni])
                 let ng = curG + step * lane + turn
                 let known = visitStamp[ni] == gen ? gScore[ni] : .infinity
                 if ng < known {
@@ -384,6 +454,7 @@ final class Router {
                     visitStamp[ni] = gen
                     cameFrom[ni] = Int32(cur)
                     dirOf[ni] = Int8(di)
+                    recentDirs[ni] = (history << 4 | UInt32(di)) & Router.historyMask
                     heapPush(ng + heuristic(nx, ny), Int32(ni))
                 }
             }

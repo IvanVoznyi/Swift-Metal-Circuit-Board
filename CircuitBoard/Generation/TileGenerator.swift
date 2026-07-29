@@ -195,7 +195,8 @@ final class TileGenerator {
                 // padTrace can pick it again and both traces converge on the
                 // same pad centre.
                 if let own = pool.firstIndex(of: p) { pool.remove(at: own) }
-                guard let a = padPort(p, keepout: r) else { continue }
+                let aPorts = padPorts(p, keepout: r)
+                guard let a = aPorts.first else { continue }
 
                 var b: SIMD2<Int32>?
                 var combPath: [SIMD2<Int32>]?
@@ -219,12 +220,19 @@ final class TileGenerator {
                 if b == nil {
                     guard let c = grid.freeCell(rng, keepout: r) else { continue }
                     guard let v = endVia(Int(c.x), Int(c.y)) else { continue }
-                    guard let q = padPort(v, keepout: r, toward: a) else { continue }
-                    b = q; target = v
+                    // Through `routeToPad` like every other landing, so the
+                    // via's stub is held to the same rule as a pad's.
+                    guard let hit = routeToPad(from: a, pad: v, keepout: r, via: {
+                        router.route(from: a, to: $0, keepout: r)
+                    }) else { continue }
+                    b = hit.port; combPath = hit.path; target = v
                 }
                 guard let end = b,
                       let path = combPath ?? router.route(from: a, to: end, keepout: r)
                 else { continue }
+                // The escape's own stub is drawn too. If it doubles back over
+                // the route, drop this pin rather than draw the wedge.
+                if stubDoublesBack(Array(path.reversed()), port: a, pad: p) { continue }
                 grid.claim(path, width: w)
                 data.pads[p].taken = true
                 if let target { data.pads[target].taken = true }
@@ -289,9 +297,10 @@ final class TileGenerator {
                 guard let hit = routeToPad(from: pa, pad: bi, keepout: r, via: {
                     router.route(from: pa, to: $0, keepout: r)
                 }) else { continue }
-                if best == nil { best = hit.path }
-                let head = Array(hit.path.reversed())
-                if !stubDoublesBack(head, port: pa, pad: ai) {
+                // Both stubs are drawn, so both have to carry on the way the
+                // route runs. No port that does, no trace: there are nine more
+                // pairs to try.
+                if !stubDoublesBack(Array(hit.path.reversed()), port: pa, pad: ai) {
                     best = hit.path
                     break
                 }
