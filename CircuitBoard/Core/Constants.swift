@@ -81,6 +81,16 @@ enum Routing {
         SIMD2(-1, 0), SIMD2(-1, -1), SIMD2(0, -1), SIMD2(1, -1),
     ]
 
+    /// The heuristic is scaled slightly past admissible.
+    ///
+    /// Measured over 25 tiles: 19.7 ms to 16.0 ms, and the boards come out
+    /// marginally *better* by every measure available — 2434 traces to 2471,
+    /// mean copper 360.1 px to 356.1, bends per trace 4.73 to 4.63. An exactly
+    /// admissible heuristic leaves A\* free to wander among equal-cost paths;
+    /// the weight breaks those ties toward the goal. Past about 1.35 it costs
+    /// time again as the paths themselves start to degrade.
+    static let heuristicWeight: Float = 1.20
+
     /// Octile heuristic's diagonal surcharge (√2 − 1).
     static let diagonalExtra: Float = 0.4142
     static let diagonalStep: Float = 1.4142

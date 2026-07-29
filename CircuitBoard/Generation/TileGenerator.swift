@@ -27,6 +27,10 @@ final class TileGenerator {
     /// Pin rows handed to the fan-out router, as indices into `data.pads`.
     var combs: [[Int]] = []
     var chipSeq = 0
+    /// Rasterised label bitmaps, kept for the life of this generator. A
+    /// generator is pooled and reused across tiles, so this warms once per
+    /// worker and never needs a lock.
+    var textBitmaps: [String: TextRaster.Bitmap] = [:]
 
     /// The cluster makers a `parts` slot can draw, in the original's order —
     /// `pick` indexes this list, so reordering it changes every board.
@@ -88,7 +92,8 @@ final class TileGenerator {
         var textSites: [SIMD2<Float>] = []
         for label in labels {
             textSites += TextRaster.glyphSites(label.text, size: label.size, bold: true,
-                                               x: label.x, y: label.y, tileWidth: width)
+                                               x: label.x, y: label.y, tileWidth: width,
+                                               cache: &textBitmaps)
         }
 
         // Each covered lattice point reserves a cell, so copper flows around

@@ -165,7 +165,7 @@ final class PostPass {
             let history = historyFlip ? targets.historyB : targets.historyA
             let destination = historyFlip ? targets.historyA : targets.historyB
             post.historyValid = historyReady ? 1 : 0
-            blit(temporalPSO, from: [targets.scene, history], into: destination,
+            blit(temporalPSO, from: [targets.scene, history], into: destination, label: "temporal reproject",
                  uniforms: &post, view: temporal.view, in: command)
             accumulated = destination
             historyFlip.toggle()
@@ -178,16 +178,16 @@ final class PostPass {
         // field — the flat view — rather than run with a zero radius.
         let lit = options.dofStrength > 0
         if lit {
-            blit(dofH, from: [accumulated], into: targets.halfBlurred,
+            blit(dofH, from: [accumulated], into: targets.halfBlurred, label: "depth of field · horizontal",
                  uniforms: &post, in: command)
-            blit(dofV, from: [targets.halfBlurred], into: targets.focused,
+            blit(dofV, from: [targets.halfBlurred], into: targets.focused, label: "depth of field · vertical",
                  uniforms: &post, in: command)
         }
         let composited = lit ? targets.focused : accumulated
 
-        blit(prefilter, from: [composited], into: targets.bloomA, in: command)
-        blit(blurH, from: [targets.bloomA], into: targets.bloomB, in: command)
-        blit(blurV, from: [targets.bloomB], into: targets.bloomA, in: command)
+        blit(prefilter, from: [composited], into: targets.bloomA, label: "bloom prefilter", in: command)
+        blit(blurH, from: [targets.bloomA], into: targets.bloomB, label: "bloom blur · horizontal", in: command)
+        blit(blurV, from: [targets.bloomB], into: targets.bloomA, label: "bloom blur · vertical", in: command)
 
         guard let enc = command.makeRenderCommandEncoder(descriptor: drawableTarget) else { return }
         enc.label = "composite"
@@ -203,8 +203,12 @@ final class PostPass {
     /// history on resize, which is the one time it is meaningless.
     func resetHistoryForTesting() { historyReady = false }
 
+    /// `label` is not decoration: without it a GPU capture shows this chain as
+    /// "Render Command 1…5" and there is no way to tell the bloom prefilter
+    /// from the depth-of-field blur. The scene pass costs 295 µs; these five
+    /// cost 5.7 ms between them, so they are the ones worth reading.
     private func blit(_ pipeline: MTLRenderPipelineState, from sources: [MTLTexture],
-                      into target: MTLTexture,
+                      into target: MTLTexture, label: String = "post",
                       uniforms: UnsafeMutablePointer<PCBPostUniforms>? = nil,
                       view: PCBViewUniforms? = nil,
                       in command: MTLCommandBuffer) {
@@ -213,6 +217,7 @@ final class PostPass {
         d.colorAttachments[0].loadAction = .dontCare
         d.colorAttachments[0].storeAction = .store
         guard let enc = command.makeRenderCommandEncoder(descriptor: d) else { return }
+        enc.label = label
         enc.setRenderPipelineState(pipeline)
         for (i, texture) in sources.enumerated() { enc.setFragmentTexture(texture, index: i) }
         if let uniforms {

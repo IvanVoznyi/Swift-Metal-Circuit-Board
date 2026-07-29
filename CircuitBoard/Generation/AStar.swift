@@ -380,7 +380,8 @@ final class Router {
         let ex = Float(e.x), ey = Float(e.y)
         @inline(__always) func heuristic(_ x: Int, _ y: Int) -> Float {
             let dx = abs(Float(x) - ex), dy = abs(Float(y) - ey)
-            return (max(dx, dy) + Routing.diagonalExtra * min(dx, dy)) * hw
+            return (max(dx, dy) + Routing.diagonalExtra * min(dx, dy))
+                * hw * Routing.heuristicWeight
         }
 
         gScore[start] = 0

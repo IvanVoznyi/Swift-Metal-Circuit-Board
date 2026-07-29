@@ -50,6 +50,34 @@ enum TextRaster {
         }
     }
 
+    /// The rasterised bitmap on its own. It depends on the string, the size and
+    /// the weight — never on where the label sits — so it is worth keeping.
+    struct Bitmap {
+        let width: Int
+        let height: Int
+        let ascent: Float
+        let pad: Float
+        let alpha: [UInt8]
+    }
+
+    /// `coverage` split in two: the expensive half, which caches.
+    static func bitmap(_ text: String, size: CGFloat, bold: Bool) -> Bitmap? {
+        guard let c = coverage(text, size: size, bold: bold, x: 0, y: 0) else { return nil }
+        let f = font(size: size, bold: bold)
+        return Bitmap(width: c.width, height: c.height,
+                      ascent: Float(CTFontGetAscent(f)), pad: 3, alpha: c.alpha)
+    }
+
+    /// …and the cheap half, which just places it.
+    static func place(_ b: Bitmap, text: String, size: CGFloat, bold: Bool,
+                      x: Float, y: Float) -> Coverage {
+        let baselineY = y + middleBaselineOffset(size: size, bold: bold)
+        return Coverage(width: b.width, height: b.height,
+                        originX: x - b.pad,
+                        originY: baselineY - (b.ascent + b.pad),
+                        alpha: b.alpha)
+    }
+
     static func coverage(_ text: String, size: CGFloat, bold: Bool,
                          x: Float, y: Float) -> Coverage? {
         let f = font(size: size, bold: bold)
@@ -102,10 +130,18 @@ enum TextRaster {
 
     /// (`glyphSites`) — the lattice points a label covers. Each one reserves a
     /// grid cell, so copper routes around the letter shapes.
+    /// Lattice points a label covers. `cache` is the caller's own — one per
+    /// worker, so no lock — and holds the rasterised bitmaps, which recur
+    /// constantly: a handful of prefixes, two digits and a few sizes.
     static func glyphSites(_ text: String, size: CGFloat, bold: Bool,
-                           x: Float, y: Float,
-                           tileWidth: Float) -> [SIMD2<Float>] {
-        guard let cov = coverage(text, size: size, bold: bold, x: x, y: y) else { return [] }
+                           x: Float, y: Float, tileWidth: Float,
+                           cache: inout [String: Bitmap]) -> [SIMD2<Float>] {
+        let key = "\(text)|\(size)|\(bold)"
+        let bm: Bitmap
+        if let hit = cache[key] { bm = hit }
+        else if let made = bitmap(text, size: size, bold: bold) { bm = made; cache[key] = made }
+        else { return [] }
+        let cov = place(bm, text: text, size: size, bold: bold, x: x, y: y)
         let step = Float(Draw.glyphLattice)
         var out: [SIMD2<Float>] = []
 
