@@ -9,7 +9,7 @@ struct ContentView: View {
         ZStack(alignment: .bottom) {
             if showTitle {
                 VStack {
-                    Text("Hello Wordl!")
+                    Text("Hello World!")
                         .font(.system(size: 100, weight: .bold, design: .rounded))
                         .shadow(radius: 1)
                         .foregroundStyle(Color.white)
