@@ -10,14 +10,15 @@ struct SeamPort {
     var cls: TraceClass
     var colorIndex: Int
     var row: Int
-    /// What both neighbours must agree on for this crossing's runner: the head
-    /// crosses the boundary at `pulseOrigin`, moving at `pulseSpeed` board
-    /// units a second, repeating every `pulsePeriod`, travelling downward in
-    /// world space when `pulseDown`. Each half turns these into its own clock
-    /// from its own length — see `Pulse.clock(_:length:)`.
+    /// What both neighbours must agree on for this crossing's runner: a wave
+    /// moving at `pulseSpeed` board units a second, standing at `pulsePhase`
+    /// when the clock starts, travelling downward in world space when
+    /// `pulseDown`. Each half turns these into its own clock from its own
+    /// length — see `Pulse.clock(_:length:)`. Nothing else has to be agreed:
+    /// the spacing of the crests is a constant, and where they fall is read off
+    /// the boundary the two halves already share.
     var pulseSpeed: Float = 0
-    var pulsePeriod: Float = 1
-    var pulseOrigin: Float = 0
+    var pulsePhase: Float = 0
     var pulseDown: Bool = true
 }
 
@@ -46,15 +47,12 @@ extension TileGenerator {
             // uses: a crossing of the reference length takes `travel` seconds.
             let travel = rng.float(Pulse.travel)
             let speed = Pulse.crossingReference / travel
-            let clearing = travel * Pulse.width * Pulse.tail
-            let period = Pulse.crossingSweep / speed + clearing + rng.float(Pulse.delay)
-            let origin = rng.float(0, period)
+            let phase = rng.float(0, Float(PCB_RUNNER_WAVELENGTH) / speed)
             let down = rng.coinFlip()
             if out.contains(where: { abs($0.gx - gx) < Seam.minColumnGap }) { continue }
             let cls: TraceClass = u < Seam.mainCut ? .main : (u < Seam.busCut ? .bus : .signal)
             out.append(SeamPort(gx: gx, cls: cls, colorIndex: ci, row: 0,
-                                pulseSpeed: speed, pulsePeriod: period,
-                                pulseOrigin: origin, pulseDown: down))
+                                pulseSpeed: speed, pulsePhase: phase, pulseDown: down))
         }
 
         rng.snapshot = save
@@ -63,15 +61,14 @@ extension TileGenerator {
 
     /// This half's share of the crossing's runner.
     ///
-    /// A half is crossed *before* the boundary when the head travels toward it
-    /// — downward through a port on this tile's bottom edge, or upward through
-    /// one on its top edge. That half's head runs from its far pad to the seam,
-    /// which is backwards along the polyline, a seam trace being stored
-    /// seam-end first.
+    /// A half lies upstream of the boundary when the wave travels toward it —
+    /// downward through a port on this tile's bottom edge, or upward through one
+    /// on its top edge. A seam trace is stored seam-end first, so an upstream
+    /// half measures its arc *backwards* from the boundary, and that sign is all
+    /// that distinguishes the two halves of one wave.
     func crossingPulse(_ port: SeamPort) -> Pulse.Crossing {
         Pulse.Crossing(speed: port.pulseSpeed,
-                       period: port.pulsePeriod,
-                       origin: port.pulseOrigin,
+                       phase: port.pulsePhase,
                        towardSeam: (port.row == 0) != port.pulseDown)
     }
 

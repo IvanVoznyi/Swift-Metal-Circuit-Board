@@ -132,6 +132,8 @@ struct TraceVertexOut {
     float  fogFactor;
     float4 baseColor;
     float3 pulseParameters; // phase, period, speed
+    /// 1 / trace length, board units. Non-zero = on the shared spatial wave.
+    float  pulseUnit;
 };
 
 vertex TraceVertexOut trace_vertex(uint vertexID [[vertex_id]],
@@ -177,6 +179,7 @@ vertex TraceVertexOut trace_vertex(uint vertexID [[vertex_id]],
         ? float4(passUniforms.or_, passUniforms.og, passUniforms.ob, passUniforms.oa)
         : float4(traceInfo.cr, traceInfo.cg, traceInfo.cb, traceInfo.ca);
     out.pulseParameters          = float3(traceInfo.pulsePhase, traceInfo.pulsePeriod, traceInfo.pulseSpeed);
+    out.pulseUnit                = traceInfo.pulseUnit;
 
     return out;
 }
@@ -199,9 +202,29 @@ fragment float4 trace_fragment(TraceVertexOut in [[stage_in]],
         const float pulseCycleTime = fract((viewUniforms.pulseTime + in.pulseParameters.x) / pulsePeriod) * pulsePeriod;
         const float runnerHeadPosition = pulseCycleTime * in.pulseParameters.z;
 
-        const float distanceBehindHead = runnerHeadPosition - in.arcLengthDistance;
-        const float noseSoftnessFactor = 1.0 - saturate(-distanceBehindHead / PCB_RUNNER_NOSE);
-        const float runnerNormalizedLength = 1.0 - saturate(distanceBehindHead / PCB_RUNNER_LENGTH);
+        // On the spatial wave the head's size is a length in board units, so it
+        // stays put as the line crosses into a half of a different length. Off
+        // it, the head is the old fraction of this trace's own arc.
+        const float onWave = step(1e-9, in.pulseUnit);
+        const float runnerSpan = mix(PCB_RUNNER_LENGTH, PCB_RUNNER_SPAN * in.pulseUnit, onWave);
+        const float runnerNose = mix(PCB_RUNNER_NOSE, PCB_RUNNER_NOSE_SPAN * in.pulseUnit, onWave);
+
+        // `arcLengthDistance` is signed on a crossing: negative upstream of the
+        // boundary, positive downstream, and zero exactly on it in both halves.
+        // Folding by one wavelength is the whole of the continuity — the two
+        // halves land on the same phase of the same wave without either knowing
+        // the other exists.
+        float distanceBehindHead = runnerHeadPosition - in.arcLengthDistance;
+        if (onWave > 0.5) {
+            const float wrap = PCB_RUNNER_WAVELENGTH * in.pulseUnit;
+            distanceBehindHead -= floor(distanceBehindHead / wrap) * wrap;
+            // Just short of a full wavelength behind is the softened nose of the
+            // head in front, not the far tail of the one behind.
+            if (distanceBehindHead > wrap - runnerNose) { distanceBehindHead -= wrap; }
+        }
+
+        const float noseSoftnessFactor = 1.0 - saturate(-distanceBehindHead / runnerNose);
+        const float runnerNormalizedLength = 1.0 - saturate(distanceBehindHead / runnerSpan);
         const float runnerBodyBrightness = smoothstep(0.0, PCB_RUNNER_TAIL, runnerNormalizedLength);
 
         const float runnerCoreFactor = 1.0 - smoothstep(PCB_PULSE_CORE * 0.55, PCB_PULSE_CORE, absoluteNormalizedEdge);

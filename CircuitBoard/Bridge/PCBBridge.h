@@ -183,6 +183,24 @@
 #define PCB_RUNNER_TAIL      0.62    // of the runner: how much of it fades out
 #define PCB_RUNNER_NOSE      0.018   // arc ahead of the head the edge softens over
 
+// A crossing is one line drawn by two tiles that cannot compare notes, so its
+// runner is a wave in SPACE rather than one head per trace: heads every
+// WAVELENGTH board units, travelling at the speed the seam agreed. Each half
+// then needs only its own length to place them — never its neighbour's.
+//
+// Sizing the head in board units rather than as a fraction of arc is not a
+// detail: the two halves of a crossing have different lengths, so the old
+// fraction changed the head's physical size as it passed the boundary, by up
+// to 919 px on the measured set.
+//
+// SPAN / WAVELENGTH is how much of the time any one point is lit — 14%, which
+// is what an ordinary trace already does. WAVELENGTH against a crossing's own
+// length is how often it has a light on it anywhere: 80% at the median 958 px,
+// against 19% for the single head this replaced.
+#define PCB_RUNNER_WAVELENGTH 1000.0 // board units between one head and the next
+#define PCB_RUNNER_SPAN        140.0 // lit length of one head, board units
+#define PCB_RUNNER_NOSE_SPAN     8.0 // softened arc ahead of it, board units
+
 #define PCB_PULSE_WIDTH      0.16    // head length, as a fraction of the trace
 #define PCB_PULSE_GAIN       5.2     // how far above the trace colour the head burns
 // How much of the stroke's half-width the moving light occupies. It is a
@@ -308,6 +326,11 @@ typedef struct {
     /// of the trace the head covers per second — so 1/speed is how long the
     /// crossing takes and the rest of the period is the wait.
     float pulsePhase, pulsePeriod, pulseSpeed;
+    /// Normalised arc per board unit — 1 / this trace's length. Non-zero puts
+    /// the trace on the shared spatial wave (see PCB_RUNNER_WAVELENGTH) and is
+    /// what converts the board-unit runner constants into this trace's own
+    /// parameter. Zero keeps the one-head-per-trace clock above.
+    float pulseUnit;
 } PCBTraceInfo;
 
 /// One corner of a trace's ribbon. Two per centreline point, one either side.

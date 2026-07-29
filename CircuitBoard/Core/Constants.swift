@@ -416,51 +416,44 @@ enum Pulse {
                      speed: 1 / crossing)
     }
 
-    /// A crossing's pulse is defined in absolute distance from the boundary
-    /// rather than as a fraction of either half, and that is the whole trick:
-    /// the two halves are drawn by tiles that cannot compare notes, but each
-    /// one needs only its *own* length to place the head — never its
-    /// neighbour's. Both read these three numbers from the same seam hash, so
-    /// one head runs the length of the line and crosses the boundary without
-    /// either side knowing what is on the other.
+    /// A crossing is one line drawn by two tiles that cannot compare notes, so
+    /// its runner is a wave in space rather than a head per trace: crests every
+    /// `PCB_RUNNER_WAVELENGTH` board units, moving at a speed the seam agreed.
+    ///
+    /// That is the whole of it. A single head would have to clear the entire
+    /// line before the next set off, and no tile knows the entire line — which
+    /// forced a sweep long enough for the longest crossing anyone might build,
+    /// and left every crossing dark most of the time to pay for it. A wave has
+    /// no such bound: each half places the crests that fall on its own arc,
+    /// needing only its own length, and the two halves agree because they are
+    /// reading the same wave off the same boundary.
     struct Crossing {
         /// Board units per second, shared by both halves.
         var speed: Float
-        /// Seconds from one head setting off to the next.
-        var period: Float
-        /// When the head sits exactly on the boundary.
-        var origin: Float
-        /// This half is the one crossed *before* the boundary, so its head runs
-        /// from the far pad to the seam — backwards along the stored polyline.
+        /// Seconds, shared: where the wave stands at t = 0.
+        var phase: Float
+        /// This half lies upstream of the boundary, so its arc counts backwards
+        /// from it — the sign that makes one wave out of two polylines.
         var towardSeam: Bool
     }
 
-    /// Distance one head sweeps per cycle, board units.
-    ///
-    /// This is what keeps a crossing to one runner: the next head cannot set
-    /// off until this one has cleared the whole line, and neither tile knows
-    /// the whole line's length, so the bound has to be a shared constant.
-    /// Measured over 300 crossings — median 953, p90 2174, longest 5181 — a
-    /// sweep of 3000 leaves 3 lines long enough to carry two heads at once;
-    /// 4000 and above leaves none. 5000 keeps margin over the longest for
-    /// boards nobody has measured. It costs liveliness, and directly: a
-    /// crossing is lit about `length / sweep` of the time, 19% at the median
-    /// against the ~47% an ordinary trace enjoys. Lower it for busier seams,
-    /// at the price of the occasional long line carrying two heads.
-    static let crossingSweep: Float = 5000
-    /// A crossing of this length takes `travel` seconds, which is what ties the
-    /// shared speed back to the timing every other trace already uses.
+    /// A crossing of this length takes `travel` seconds end to end, which ties
+    /// the wave's speed to the timing every other trace already uses.
     static let crossingReference: Float = 950
 
     /// This half's clock, from what the seam agreed and this half's own length.
+    ///
+    /// `speed` reaches the shader as normalised arc per second, and `period` as
+    /// the time for one wavelength — so the head sweeps exactly one wavelength
+    /// of parameter per cycle and the shader's fold does the rest. Both come out
+    /// of the *shared* speed, so the crest sits at the same board-unit distance
+    /// from the boundary in either half at any instant.
     static func clock(_ c: Crossing, length: Float) -> Clock {
-        let crossing = max(length, 1e-3) / max(c.speed, 1e-3)
-        // The head reaches the boundary at `origin`; a half crossed before it
-        // therefore sets off a crossing-time earlier.
-        let entry = c.towardSeam ? c.origin - crossing : c.origin
-        var phase = (-entry).truncatingRemainder(dividingBy: c.period)
-        if phase < 0 { phase += c.period }
-        return Clock(phase: phase, period: c.period, speed: 1 / crossing)
+        let unit = 1 / max(length, 1e-3)
+        let speed = max(c.speed, 1e-3)
+        return Clock(phase: c.phase,
+                     period: Float(PCB_RUNNER_WAVELENGTH) / speed,
+                     speed: speed * unit)
     }
 
     /// Where a head is along its trace at `time`. Past 1 it has run off the end
