@@ -122,6 +122,10 @@ enum Seam {
     static let minColumnGap: Int = 4
     /// Cells reserved inward from each port until that port's turn comes.
     static let reservedDepth = 9
+    /// Cells each half of a crossing runs straight before the router takes
+    /// over, so both halves stay collinear with the stubs that meet on the
+    /// boundary. Must stay inside `reservedDepth`, which is what makes it free.
+    static let straightLead = 4
     /// `seamFallback` walks this far in looking for room to drop a via.
     static let fallbackDepth: ClosedRange<Int> = 3...7
     /// Class mix: u < mainCut → main, u < busCut → bus, else signal.
@@ -410,6 +414,53 @@ enum Pulse {
         return Clock(phase: rng.float(0, period),
                      period: period,
                      speed: 1 / crossing)
+    }
+
+    /// A crossing's pulse is defined in absolute distance from the boundary
+    /// rather than as a fraction of either half, and that is the whole trick:
+    /// the two halves are drawn by tiles that cannot compare notes, but each
+    /// one needs only its *own* length to place the head — never its
+    /// neighbour's. Both read these three numbers from the same seam hash, so
+    /// one head runs the length of the line and crosses the boundary without
+    /// either side knowing what is on the other.
+    struct Crossing {
+        /// Board units per second, shared by both halves.
+        var speed: Float
+        /// Seconds from one head setting off to the next.
+        var period: Float
+        /// When the head sits exactly on the boundary.
+        var origin: Float
+        /// This half is the one crossed *before* the boundary, so its head runs
+        /// from the far pad to the seam — backwards along the stored polyline.
+        var towardSeam: Bool
+    }
+
+    /// Distance one head sweeps per cycle, board units.
+    ///
+    /// This is what keeps a crossing to one runner: the next head cannot set
+    /// off until this one has cleared the whole line, and neither tile knows
+    /// the whole line's length, so the bound has to be a shared constant.
+    /// Measured over 300 crossings — median 953, p90 2174, longest 5181 — a
+    /// sweep of 3000 leaves 3 lines long enough to carry two heads at once;
+    /// 4000 and above leaves none. 5000 keeps margin over the longest for
+    /// boards nobody has measured. It costs liveliness, and directly: a
+    /// crossing is lit about `length / sweep` of the time, 19% at the median
+    /// against the ~47% an ordinary trace enjoys. Lower it for busier seams,
+    /// at the price of the occasional long line carrying two heads.
+    static let crossingSweep: Float = 5000
+    /// A crossing of this length takes `travel` seconds, which is what ties the
+    /// shared speed back to the timing every other trace already uses.
+    static let crossingReference: Float = 950
+
+    /// This half's clock, from what the seam agreed and this half's own length.
+    static func clock(_ c: Crossing, length: Float) -> Clock {
+        let crossing = max(length, 1e-3) / max(c.speed, 1e-3)
+        // The head reaches the boundary at `origin`; a half crossed before it
+        // therefore sets off a crossing-time earlier.
+        let entry = c.towardSeam ? c.origin - crossing : c.origin
+        var phase = (-entry).truncatingRemainder(dividingBy: c.period)
+        if phase < 0 { phase += c.period }
+        return Clock(phase: phase, period: c.period, speed: 1 / crossing)
     }
 
     /// Where a head is along its trace at `time`. Past 1 it has run off the end

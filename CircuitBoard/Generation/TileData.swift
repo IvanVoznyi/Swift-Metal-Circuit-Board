@@ -39,6 +39,11 @@ struct Trace {
     /// This end is a seam port: the polyline runs off the tile edge so the
     /// neighbouring tile's matching trace continues the line.
     var edgeA = false
+    /// Set on both halves of a seam crossing, from terms the two neighbours
+    /// read out of the same hash. Without it each half draws its own clock, and
+    /// one line carries two runners at unrelated speeds — which is what it
+    /// looked like, because it was two traces all along.
+    var crossing: Pulse.Crossing? = nil
 }
 
 struct ChipBody {
@@ -104,9 +109,14 @@ struct TileData {
         if let a = trace.padA {
             pts.append(SIMD2(geo.px(pads[a].gx), geo.py(pads[a].gy)))
         } else if trace.edgeA, let first = trace.path.first {
-            // Run the line clear off the tile edge so it meets its twin.
+            // Stop exactly on the tile edge. The twin on the other side starts
+            // on that same edge, so the halves meet with no gap — and, unlike
+            // an overhang, neither draws over the other. Tiles composite
+            // source-over, so a shared band was the glow and the antialiased
+            // rim laid down twice: a visibly denser stretch of line with hard
+            // ends, sitting right on the boundary.
             pts.append(SIMD2(geo.px(Int(first.x)),
-                             first.y == 0 ? -5 : Board.tileHeight + 5))
+                             first.y == 0 ? 0 : Board.tileHeight))
         }
         for c in trace.path {
             pts.append(SIMD2(geo.px(Int(c.x)), geo.py(Int(c.y))))

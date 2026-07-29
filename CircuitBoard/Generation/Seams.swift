@@ -10,6 +10,15 @@ struct SeamPort {
     var cls: TraceClass
     var colorIndex: Int
     var row: Int
+    /// What both neighbours must agree on for this crossing's runner: the head
+    /// crosses the boundary at `pulseOrigin`, moving at `pulseSpeed` board
+    /// units a second, repeating every `pulsePeriod`, travelling downward in
+    /// world space when `pulseDown`. Each half turns these into its own clock
+    /// from its own length — see `Pulse.clock(_:length:)`.
+    var pulseSpeed: Float = 0
+    var pulsePeriod: Float = 1
+    var pulseOrigin: Float = 0
+    var pulseDown: Bool = true
 }
 
 extension TileGenerator {
@@ -32,13 +41,82 @@ extension TileGenerator {
             let gx = rng.int(2, grid.cols - 3)
             let u = rng.float()
             let ci = rng.int(0, palette.traces.count - 1)
+            // The runner's terms, drawn here so both neighbours read the same
+            // ones. Speed is pinned to the timing every other trace already
+            // uses: a crossing of the reference length takes `travel` seconds.
+            let travel = rng.float(Pulse.travel)
+            let speed = Pulse.crossingReference / travel
+            let clearing = travel * Pulse.width * Pulse.tail
+            let period = Pulse.crossingSweep / speed + clearing + rng.float(Pulse.delay)
+            let origin = rng.float(0, period)
+            let down = rng.coinFlip()
             if out.contains(where: { abs($0.gx - gx) < Seam.minColumnGap }) { continue }
             let cls: TraceClass = u < Seam.mainCut ? .main : (u < Seam.busCut ? .bus : .signal)
-            out.append(SeamPort(gx: gx, cls: cls, colorIndex: ci, row: 0))
+            out.append(SeamPort(gx: gx, cls: cls, colorIndex: ci, row: 0,
+                                pulseSpeed: speed, pulsePeriod: period,
+                                pulseOrigin: origin, pulseDown: down))
         }
 
         rng.snapshot = save
         return out
+    }
+
+    /// This half's share of the crossing's runner.
+    ///
+    /// A half is crossed *before* the boundary when the head travels toward it
+    /// — downward through a port on this tile's bottom edge, or upward through
+    /// one on its top edge. That half's head runs from its far pad to the seam,
+    /// which is backwards along the polyline, a seam trace being stored
+    /// seam-end first.
+    func crossingPulse(_ port: SeamPort) -> Pulse.Crossing {
+        Pulse.Crossing(speed: port.pulseSpeed,
+                       period: port.pulsePeriod,
+                       origin: port.pulseOrigin,
+                       towardSeam: (port.row == 0) != port.pulseDown)
+    }
+
+    /// Route out of a seam port straight into the tile for one cell before A*
+    /// gets a say.
+    ///
+    /// The two halves of a crossing are drawn by different tiles and meet on
+    /// the boundary, where each contributes a stub from its own first cell to
+    /// the edge — and those stubs are vertical, because a stub runs down its
+    /// own column. So the only direction the halves can leave the seam without
+    /// putting a kink either side of that vertical pair is straight. Letting
+    /// each side pick its own angle gave a wedge; agreeing on a diagonal gave
+    /// something worse, a diagonal into 8px of vertical into a diagonal, which
+    /// reads as a step in the middle of the line. Straight through, both sides
+    /// collinear with the stubs, is the one crossing with no vertex in it.
+    ///
+    /// Falls back to an unconstrained route if a cell is taken — one kinked
+    /// crossing beats a port with no trace at all.
+    ///
+    /// Four cells, so the straight run reaches ±36 px either side of the
+    /// boundary rather than ±20. It is free: the lane these cells sit in is
+    /// reserved three wide and nine deep before a single footprint is placed,
+    /// so forcing part of it takes nothing from anyone. Measured over 300
+    /// crossings, real bends within 28 px of the boundary go 2.08 per crossing
+    /// at a lead of two to 0.30 at four, with the seam trace count unmoved at
+    /// 580. Six is no better and eight is worse — past that the constraint
+    /// starts fighting the router and the fallback fires more often.
+    func routeFromSeam(_ port: SeamPort, to target: SIMD2<Int32>,
+                       keepout r: Int) -> [SIMD2<Int32>]? {
+        let a = SIMD2(Int32(port.gx), Int32(port.row))
+        let step: Int32 = port.row == 0 ? 1 : -1
+        var lead: [SIMD2<Int32>] = [a]
+        var ok = true
+        for i in 1...Seam.straightLead {
+            let c = SIMD2(a.x, a.y + step * Int32(i))
+            guard grid.inBounds(Int(c.x), Int(c.y)), !grid.blocked(Int(c.x), Int(c.y), r) else {
+                ok = false; break
+            }
+            lead.append(c)
+        }
+        if ok, let last = lead.last,
+           let p = router.route(from: last, to: target, keepout: r) {
+            return lead.dropLast() + p
+        }
+        return router.route(from: a, to: target, keepout: r)
     }
 
     /// Every seam port is its own net, ending at a pad inside this tile.
@@ -54,27 +132,31 @@ extension TileGenerator {
         if grid.blocked(port.gx, port.row, r) { return nil }
 
         var b: SIMD2<Int32>?
+        var seamPath: [SIMD2<Int32>]?
         var padB: Int?
         if !pool.isEmpty {
             for _ in 0..<Routing.poolProbeTries {
                 let i = rng.int(0, pool.count - 1)
                 let p = pool[i]
                 if data.pads[p].taken { continue }
-                guard let q = padPort(p, keepout: r) else { continue }
-                b = q; padB = p
+                guard let hit = routeToPad(from: a, pad: p, keepout: r, via: {
+                    routeFromSeam(port, to: $0, keepout: r)
+                }) else { continue }
+                b = hit.port; seamPath = hit.path; padB = p
                 pool.remove(at: i)
                 break
             }
         }
         guard let target = b else { return nil }
-        guard let path = router.route(from: a, to: target, keepout: r) else {
+        guard let path = seamPath ?? routeFromSeam(port, to: target, keepout: r) else {
             if let padB { pool.append(padB) }   // give the pad back
             return nil
         }
         grid.claim(path, width: w)
         if let padB { data.pads[padB].taken = true }
         return Trace(path: path, color: color, width: w, cls: port.cls,
-                     padA: nil, padB: padB, edgeA: true)
+                     padA: nil, padB: padB, edgeA: true,
+                     crossing: crossingPulse(port))
     }
 
     /// A seam port that fails to reach a pad would leave the trace dangling on
@@ -104,13 +186,14 @@ extension TileGenerator {
             let padIndex = data.pads.count - 1
             grid.settleHug()
 
-            guard let b = padPort(padIndex, keepout: r) else { continue }
-            guard let path = router.route(from: SIMD2(Int32(port.gx), Int32(port.row)),
-                                          to: b, keepout: r) else { continue }
+            guard let b = padPort(padIndex, keepout: r,
+                                  toward: SIMD2(Int32(port.gx), Int32(port.row))) else { continue }
+            guard let path = routeFromSeam(port, to: b, keepout: r) else { continue }
             grid.claim(path, width: w)
             data.pads[padIndex].taken = true
             return Trace(path: path, color: color, width: w, cls: port.cls,
-                         padA: nil, padB: padIndex, edgeA: true)
+                         padA: nil, padB: padIndex, edgeA: true,
+                         crossing: crossingPulse(port))
         }
         return nil
     }

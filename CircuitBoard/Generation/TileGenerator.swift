@@ -124,8 +124,7 @@ final class TileGenerator {
                     let x = p.gx + dx
                     guard grid.inBounds(x, y) else { continue }
                     let i = grid.index(x, y)
-                    if grid.occ[i] == 0 {
-                        grid.occ[i] = 1
+                    if grid.reserve(i) {
                         cells.append(i)
                     }
                 }
@@ -168,8 +167,7 @@ final class TileGenerator {
         // essentially always produces a trace and both tiles agree on the
         // column.
         for (i, port) in seamPorts.enumerated() {
-            for c in reserved[i] { grid.release(c) }
-            grid.rebuildHug()
+            grid.release(reserved[i])
             if let t = edgeTrace(port, pool: &pool) {
                 data.traces.append(t)
             } else if let t = seamFallback(port) {
@@ -200,6 +198,7 @@ final class TileGenerator {
                 guard let a = padPort(p, keepout: r) else { continue }
 
                 var b: SIMD2<Int32>?
+                var combPath: [SIMD2<Int32>]?
                 var target: Int?
                 var k = 0
                 while k < Routing.combProbeTries && !pool.isEmpty {
@@ -210,19 +209,22 @@ final class TileGenerator {
                     // A chip pin never escapes to another pin of the same chip.
                     if data.pads[p].chip != 0,
                        data.pads[candidate].chip == data.pads[p].chip { continue }
-                    guard let q = padPort(candidate, keepout: r) else { continue }
-                    b = q; target = candidate
+                    guard let hit = routeToPad(from: a, pad: candidate, keepout: r, via: {
+                        router.route(from: a, to: $0, keepout: r)
+                    }) else { continue }
+                    b = hit.port; combPath = hit.path; target = candidate
                     pool.remove(at: i)
                     break
                 }
                 if b == nil {
                     guard let c = grid.freeCell(rng, keepout: r) else { continue }
                     guard let v = endVia(Int(c.x), Int(c.y)) else { continue }
-                    guard let q = padPort(v, keepout: r) else { continue }
+                    guard let q = padPort(v, keepout: r, toward: a) else { continue }
                     b = q; target = v
                 }
                 guard let end = b,
-                      let path = router.route(from: a, to: end, keepout: r) else { continue }
+                      let path = combPath ?? router.route(from: a, to: end, keepout: r)
+                else { continue }
                 grid.claim(path, width: w)
                 data.pads[p].taken = true
                 if let target { data.pads[target].taken = true }
@@ -280,9 +282,21 @@ final class TileGenerator {
             // Never wire two pins of one chip together.
             if a.chip != 0 && a.chip == b.chip { continue }
             if abs(a.gx - b.gx) + abs(a.gy - b.gy) < 7 { continue }
-            guard let pa = padPort(ai, keepout: r),
-                  let pb = padPort(bi, keepout: r) else { continue }
-            guard let path = router.route(from: pa, to: pb, keepout: r) else { continue }
+            // Both ends get the same treatment: a port is only right if the
+            // stub it leaves behind carries on the way the route runs.
+            var best: [SIMD2<Int32>]?
+            for pa in padPorts(ai, keepout: r, toward: SIMD2(Int32(b.gx), Int32(b.gy))) {
+                guard let hit = routeToPad(from: pa, pad: bi, keepout: r, via: {
+                    router.route(from: pa, to: $0, keepout: r)
+                }) else { continue }
+                if best == nil { best = hit.path }
+                let head = Array(hit.path.reversed())
+                if !stubDoublesBack(head, port: pa, pad: ai) {
+                    best = hit.path
+                    break
+                }
+            }
+            guard let path = best else { continue }
             grid.claim(path, width: w)
             data.pads[ai].taken = true
             data.pads[bi].taken = true

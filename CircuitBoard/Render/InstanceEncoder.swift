@@ -116,18 +116,28 @@ struct InstanceEncoder {
             let index = UInt32(out.traceInfos.count)
             let blockStart = vertexCursor
             vertexCursor += pts.count * 2 + 2
-            let clock = Pulse.clock(from: Rng(seed: Self.pulseSeed(pts, i)))
+            // Arc length along the trace, normalised, so the pulse travels at a
+            // steady speed rather than jumping between long and short segments.
+            var total: Float = 0
+            for j in 1..<pts.count { total += distance(pts[j - 1], pts[j]) }
+            let inverse = total > 1e-5 ? 1 / total : 0
+
+            // Half of a seam crossing: take the clock from what the two tiles
+            // agreed rather than from this half's own geometry, or the line
+            // gets one runner per half at unrelated speeds. `towardSeam` also
+            // says the head runs from the far pad to the boundary, and a seam
+            // trace is stored seam-end first — so that half's parameter is
+            // measured from the other end. Reversing `s` costs nothing: the
+            // ribbon, and the teardrops keyed to `padA`/`padB`, are untouched.
+            let reversed = t.crossing?.towardSeam ?? false
+            let clock = t.crossing.map { Pulse.clock($0, length: total) }
+                ?? Pulse.clock(from: Rng(seed: Self.pulseSeed(pts, i)))
             out.traceInfos.append(PCBTraceInfo(halfWidth: t.width / 2,
                                                cr: t.color.x, cg: t.color.y, cb: t.color.z,
                                                ca: 1,
                                                pulsePhase: clock.phase,
                                                pulsePeriod: clock.period,
                                                pulseSpeed: clock.speed))
-            // Arc length along the trace, normalised, so the pulse travels at a
-            // steady speed rather than jumping between long and short segments.
-            var total: Float = 0
-            for j in 1..<pts.count { total += distance(pts[j - 1], pts[j]) }
-            let inverse = total > 1e-5 ? 1 / total : 0
 
             var travelled: Float = 0
             for (j, p) in pts.enumerated() {
@@ -138,7 +148,8 @@ struct InstanceEncoder {
                 // +1 leaves room for the leading duplicate.
                 out.pathPoints.append(PCBPathPoint(x: p.x, y: p.y,
                                                    traceIndex: index, flags: flags,
-                                                   s: travelled * inverse,
+                                                   s: reversed ? 1 - travelled * inverse
+                                                              : travelled * inverse,
                                                    vertexBase: Float(blockStart + 1 + j * 2),
                                                    _pad1: 0, _pad2: 0))
             }

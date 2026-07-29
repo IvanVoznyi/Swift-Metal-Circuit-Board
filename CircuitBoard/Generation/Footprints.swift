@@ -64,19 +64,86 @@ extension TileGenerator {
     /// the pad's own row/column and never leaves the corridor the pad and
     /// `claim` reserved. Diagonal ports, or a single reach of max(rx, ry),
     /// would put the stub out over open board another trace is entitled to use.
-    func padPort(_ padIndex: Int, keepout r: Int) -> SIMD2<Int32>? {
+    /// `toward` is where the trace runs to, or comes from. The port goes on
+    /// that side when it can, because the stub from the port back to the pad
+    /// centre is drawn as part of the trace but was never routed: put the port
+    /// on the far side and that stub doubles back over the route's own last
+    /// cells, two parallel runs a stroke width apart that read as one line
+    /// ending in a spike. It also routes better — the escape starts pointing
+    /// at where it is going instead of behind the pad.
+    func padPorts(_ padIndex: Int, keepout r: Int, toward: SIMD2<Int32>? = nil) -> [SIMD2<Int32>] {
         let dirs = [SIMD2(1, 0), SIMD2(-1, 0), SIMD2(0, 1), SIMD2(0, -1)]
         let start = rng.int(0, 3)
         let p = data.pads[padIndex]
-        for k in 0..<4 {
-            let d = dirs[(k + start) % 4]
+        // The rotation by `start` is the tie-break, not the choice.
+        var order = (0..<4).map { ($0 + start) % 4 }
+        if let toward {
+            let vx = Float(Int(toward.x) - p.gx), vy = Float(Int(toward.y) - p.gy)
+            let n = (vx * vx + vy * vy).squareRoot()
+            if n > 0 {
+                let ux = vx / n, uy = vy / n
+                // Ordered on (score, rotation) — a total order, so this does
+                // not depend on the sort being stable.
+                order = order.enumerated().sorted { l, r in
+                    let sl = Float(dirs[l.element].x) * ux + Float(dirs[l.element].y) * uy
+                    let sr = Float(dirs[r.element].x) * ux + Float(dirs[r.element].y) * uy
+                    return sl != sr ? sl > sr : l.offset < r.offset
+                }.map(\.element)
+            }
+        }
+        var out: [SIMD2<Int32>] = []
+        for k in order {
+            let d = dirs[k]
             let gx = p.gx + d.x * (p.rx + 1 + r)
             let gy = p.gy + d.y * (p.ry + 1 + r)
             if !grid.inBounds(gx, gy) { continue }
             if grid.blocked(gx, gy, r) { continue }
-            return SIMD2(Int32(gx), Int32(gy))
+            out.append(SIMD2(Int32(gx), Int32(gy)))
         }
-        return nil
+        return out
+    }
+
+    /// The best legal port, when the caller cannot try more than one.
+    func padPort(_ padIndex: Int, keepout r: Int, toward: SIMD2<Int32>? = nil) -> SIMD2<Int32>? {
+        padPorts(padIndex, keepout: r, toward: toward).first
+    }
+
+    /// Does the un-routed stub from `port` to the pad centre run back against
+    /// the way the route arrived? That is the spike: two parallel runs a
+    /// stroke apart, reading as one line that ends in a point.
+    func stubDoublesBack(_ path: [SIMD2<Int32>], port: SIMD2<Int32>, pad: Int) -> Bool {
+        guard path.count >= 2 else { return false }
+        let p = data.pads[pad]
+        let stub = SIMD2<Float>(Float(p.gx) - Float(port.x), Float(p.gy) - Float(port.y))
+        let sl = (stub.x * stub.x + stub.y * stub.y).squareRoot()
+        guard sl > 0 else { return false }
+        let sx = stub.x / sl, sy = stub.y / sl
+        // Look back along the route as far as the eye reads the two runs as one
+        // line — about five cells — not just at the final step.
+        var arc: Float = 0
+        var i = path.count - 1
+        while i > 0, arc < 5 {
+            let v = SIMD2<Float>(Float(path[i].x - path[i-1].x), Float(path[i].y - path[i-1].y))
+            let l = (v.x * v.x + v.y * v.y).squareRoot()
+            arc += l
+            if l > 0, (v.x / l) * sx + (v.y / l) * sy < -0.7071 { return true }
+            i -= 1
+        }
+        return false
+    }
+
+    /// Route to a pad, preferring a port whose stub carries on the way the
+    /// route came in. The first choice is right ~94% of the time and costs one
+    /// route as before; only the rest pay for a second look.
+    func routeToPad(from start: SIMD2<Int32>, pad: Int, keepout r: Int,
+                    via: (SIMD2<Int32>) -> [SIMD2<Int32>]?) -> (path: [SIMD2<Int32>], port: SIMD2<Int32>)? {
+        var fallback: (path: [SIMD2<Int32>], port: SIMD2<Int32>)?
+        for q in padPorts(pad, keepout: r, toward: start) {
+            guard let path = via(q) else { continue }
+            if !stubDoublesBack(path, port: q, pad: pad) { return (path, q) }
+            if fallback == nil { fallback = (path, q) }
+        }
+        return fallback
     }
 
     func markPads(_ indices: [Int]) {

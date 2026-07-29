@@ -19,6 +19,19 @@ final class RoutingGrid {
     private let occStore: UnsafeMutableBufferPointer<UInt8>
     private let hugStore: UnsafeMutableBufferPointer<UInt8>
 
+    /// Bumped by every change `blocked` can see — occupancy and the hug field
+    /// both. It lets a caller cache something derived from the grid and know
+    /// exactly when to throw it away; `Router`'s component labels are the one
+    /// that matters, and they are only sound because this counts hug changes
+    /// too, `blocked(_:_:1)` being a hug lookup.
+    private(set) var version: UInt64 = 0
+
+    /// Visited marks for the local hug repair. Separate from the field itself
+    /// because the repair has to propagate *through* cells whose value is
+    /// already correct, which it could not do if the value were the mark.
+    private let repairStamp: UnsafeMutableBufferPointer<UInt32>
+    private var repairGeneration: UInt32 = 0
+
     /// Cells that became occupied since the last hug settle. `hug` is a pure
     /// function of `occ`, and Chebyshev dilation is local, so re-deriving only
     /// the neighbourhood of these cells is identical to rebuilding the whole
@@ -33,8 +46,10 @@ final class RoutingGrid {
         count = cols * rows
         occStore = .allocate(capacity: count)
         hugStore = .allocate(capacity: count)
+        repairStamp = .allocate(capacity: count)
         occStore.initialize(repeating: 0)
         hugStore.initialize(repeating: 0)
+        repairStamp.initialize(repeating: 0)
         pendingSources.reserveCapacity(1024)
         frontier.reserveCapacity(4096)
         nextFrontier.reserveCapacity(4096)
@@ -43,6 +58,7 @@ final class RoutingGrid {
     deinit {
         occStore.deallocate()
         hugStore.deallocate()
+        repairStamp.deallocate()
     }
 
     var occ: UnsafeMutableBufferPointer<UInt8> { occStore }
@@ -54,6 +70,7 @@ final class RoutingGrid {
     }
 
     func clear() {
+        version &+= 1
         occStore.update(repeating: 0)
         hugStore.update(repeating: 0)
         pendingSources.removeAll(keepingCapacity: true)
@@ -72,6 +89,7 @@ final class RoutingGrid {
     }
 
     func markBox(_ x0: Int, _ y0: Int, _ x1: Int, _ y1: Int) {
+        version &+= 1
         let ly = max(0, y0), hy = min(rows - 1, y1)
         let lx = max(0, x0), hx = min(cols - 1, x1)
         guard ly <= hy, lx <= hx else { return }
@@ -105,10 +123,123 @@ final class RoutingGrid {
         return false
     }
 
+    /// Claim a single cell outright — no keepout, no hug bookkeeping. The seam
+    /// lanes want exactly this: reserved before the field is built, released
+    /// one at a time as each port takes its turn.
+    ///
+    /// Returns false if it was already copper. It exists so that writing to
+    /// `occ` goes through something that bumps `version`; a raw write would
+    /// leave a cached component label looking valid after the grid moved under
+    /// it.
+    @discardableResult
+    func reserve(_ i: Int) -> Bool {
+        guard occStore[i] == 0 else { return false }
+        version &+= 1
+        occStore[i] = 1
+        return true
+    }
+
+    /// Release a whole reserved lane and bring `hug` back to exactly the field
+    /// a full rebuild would produce — touching only the part that can have
+    /// changed.
+    ///
+    /// `hug[p]` is the Chebyshev distance from p to the nearest copper, capped
+    /// at `hugRadius`. Removing copper can only affect cells within that radius
+    /// of what was removed, and the new value of such a cell is decided by
+    /// copper within that radius of *it* — so the box grown by `hugRadius` is
+    /// what must be recomputed, and the box grown by twice it holds every
+    /// source that can decide the answer. Everything outside is already exact,
+    /// and is propagated through rather than rewritten.
+    ///
+    /// For the 3×9 seam lane that is ~107 cells against the grid's 16,800, and
+    /// this runs once per seam port — about nineteen times per tile, which is
+    /// what made the full rebuild a fifth of generation.
+    func release(_ cells: [Int]) {
+        guard !cells.isEmpty else { return }
+        // The repair assumes the field is exact for the copper still standing.
+        // Anything marked and not yet settled would be lost outside the box,
+        // where nothing recomputes it.
+        if !pendingSources.isEmpty { settleHug() }
+        version &+= 1
+
+        var x0 = cols, y0 = rows, x1 = -1, y1 = -1
+        for i in cells {
+            occStore[i] = 0
+            let x = i % cols, y = i / cols
+            x0 = min(x0, x); x1 = max(x1, x)
+            y0 = min(y0, y); y1 = max(y1, y)
+        }
+
+        let radius = Routing.hugRadius
+        let dx0 = max(0, x0 - radius), dy0 = max(0, y0 - radius)
+        let dx1 = min(cols - 1, x1 + radius), dy1 = min(rows - 1, y1 + radius)
+        let sx0 = max(0, x0 - 2 * radius), sy0 = max(0, y0 - 2 * radius)
+        let sx1 = min(cols - 1, x1 + 2 * radius), sy1 = min(rows - 1, y1 + 2 * radius)
+
+        for y in dy0...dy1 {
+            let row = y * cols
+            for x in dx0...dx1 { hugStore[row + x] = 0 }
+        }
+
+        repairGeneration &+= 1
+        if repairGeneration == 0 { repairStamp.update(repeating: 0); repairGeneration = 1 }
+        let gen = repairGeneration
+
+        frontier.removeAll(keepingCapacity: true)
+        for y in sy0...sy1 {
+            let row = y * cols
+            for x in sx0...sx1 where occStore[row + x] != 0 {
+                repairStamp[row + x] = gen
+                frontier.append(Int32(row + x))
+            }
+        }
+        guard !frontier.isEmpty else { return }
+
+        for level in 1...radius {
+            nextFrontier.removeAll(keepingCapacity: true)
+            let l = UInt8(level)
+            for i in frontier {
+                let x = Int(i) % cols, y = Int(i) / cols
+                for dy in -1...1 {
+                    let ny = y + dy
+                    if ny < 0 || ny >= rows { continue }
+                    let row = ny * cols
+                    for dx in -1...1 {
+                        let nx = x + dx
+                        if nx < 0 || nx >= cols { continue }
+                        let j = row + nx
+                        // Copper is a source, never a step: a cell whose line to
+                        // the nearest copper crosses other copper is nearer to
+                        // that one instead, so stopping here changes no answer.
+                        if occStore[j] != 0 { continue }
+                        if repairStamp[j] == gen { continue }
+                        repairStamp[j] = gen
+                        if nx >= dx0, nx <= dx1, ny >= dy0, ny <= dy1 { hugStore[j] = l }
+                        nextFrontier.append(Int32(j))
+                    }
+                }
+            }
+            swap(&frontier, &nextFrontier)
+            if frontier.isEmpty { break }
+        }
+        frontier.removeAll(keepingCapacity: true)
+    }
+
     /// Release a reserved cell. Distances can grow again, so callers must
     /// follow with `rebuildHug()` rather than the incremental settle.
     func release(_ i: Int) {
+        version &+= 1
         occStore[i] = 0
+    }
+
+    /// `blocked` for a caller that already holds the linear index. The
+    /// coordinate form recomputes `y * cols + x` on every call, and the
+    /// reachability pass makes eight of them per cell.
+    @inline(__always)
+    func blockedAt(_ i: Int, _ r: Int) -> Bool {
+        if r == 0 { return occStore[i] == 1 }
+        if r == 1 { return occStore[i] != 0 || hugStore[i] == 1 }
+        return blocked(i % cols, i / cols, r)
     }
 
     /// A cell is illegal for a trace of keepout radius `r` if any cell within
@@ -150,6 +281,7 @@ final class RoutingGrid {
     /// distances, and every previously stored value was already exact, so this
     /// lands on precisely the field a full rebuild would produce.
     func settleHug() {
+        version &+= 1
         guard !pendingSources.isEmpty else { return }
         frontier.removeAll(keepingCapacity: true)
         frontier.append(contentsOf: pendingSources)
@@ -184,6 +316,7 @@ final class RoutingGrid {
     /// Full multi-source rebuild. Only needed after cells are *released*
     /// (the per-port seam lanes), where distances can grow.
     func rebuildHug() {
+        version &+= 1
         hugStore.update(repeating: 0)
         pendingSources.removeAll(keepingCapacity: true)
         frontier.removeAll(keepingCapacity: true)

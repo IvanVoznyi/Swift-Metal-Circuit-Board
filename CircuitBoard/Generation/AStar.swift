@@ -20,6 +20,20 @@ final class Router {
     private let closedStamp: UnsafeMutableBufferPointer<UInt32>
     private var generation: UInt32 = 0
 
+    /// The reachability pre-pass: its own visited stamp and a plain FIFO.
+    private let reachStamp: UnsafeMutableBufferPointer<UInt32>
+    private let reachQueue: UnsafeMutableBufferPointer<Int32>
+    private var reachGeneration: UInt32 = 0
+
+    /// Component id per cell, written by a pre-pass that drained without
+    /// finding its goal — at that point the queue it walked *is* the component.
+    /// Ids are minted monotonically and never reused, so an epoch is discarded
+    /// by moving `firstValidLabel` forward rather than by clearing 16k cells.
+    private let label: UnsafeMutableBufferPointer<UInt32>
+    private var nextLabel: UInt32 = 1
+    private var firstValidLabel: UInt32 = 1
+    private var labelVersion: UInt64 = .max
+
     /// The heap is the hottest structure in the search — every push sifts and
     /// every pop sifts back — so it lives in the same manually-managed arena as
     /// the score arrays rather than paying an `Array` bounds check per swap.
@@ -45,11 +59,17 @@ final class Router {
         dirOf = .allocate(capacity: count)
         visitStamp = .allocate(capacity: count)
         closedStamp = .allocate(capacity: count)
+        reachStamp = .allocate(capacity: count)
+        reachQueue = .allocate(capacity: count)
+        label = .allocate(capacity: count)
         gScore.initialize(repeating: .infinity)
         cameFrom.initialize(repeating: -1)
         dirOf.initialize(repeating: -1)
         visitStamp.initialize(repeating: 0)
         closedStamp.initialize(repeating: 0)
+        reachStamp.initialize(repeating: 0)
+        reachQueue.initialize(repeating: 0)
+        label.initialize(repeating: 0)
         // Every open-list entry is a distinct cell at most once per push, and
         // a cell can be pushed once per incoming direction.
         heapCapacity = count * 8 + 16
@@ -66,6 +86,9 @@ final class Router {
         dirOf.deallocate()
         visitStamp.deallocate()
         closedStamp.deallocate()
+        reachStamp.deallocate()
+        reachQueue.deallocate()
+        label.deallocate()
         heapF.deallocate()
         heapV.deallocate()
     }
@@ -140,6 +163,138 @@ final class Router {
         return top
     }
 
+    // MARK: - Reachability
+
+    /// Is `goal` reachable from `start` under the router's own move rule?
+    ///
+    /// Ninety-five percent of route requests have no corridor at all — a pad
+    /// walled in by its own footprint's keepout, a pocket the last claim sealed
+    /// — and A* proves that the expensive way: it drains its open list through
+    /// the whole pocket, evaluating a lane multiplier and a turn cost at every
+    /// one of some hundreds of pops, because a heap cannot know it is enclosed
+    /// until it is empty. This answers the same question with a FIFO and two
+    /// byte loads per neighbour.
+    ///
+    /// Only a false *reject* could change a board, so the move rule below is
+    /// the router's own, unrelaxed. Over-accepting is free: A* then runs and
+    /// fails exactly as it used to, which across the whole test matrix happens
+    /// seven times in 33,000 routes.
+    private func reachable(from start: Int, to goal: Int, keepout r: Int) -> Bool {
+        if start == goal { return true }
+        let cols = grid.cols, rows = grid.rows
+
+        // A drained probe leaves the pocket it walked labelled, and a failed
+        // route changes nothing on the grid — so the next probe out of that
+        // same pocket, and there are usually several before anything is
+        // claimed, costs two loads instead of another walk.
+        if grid.version != labelVersion {
+            firstValidLabel = nextLabel
+            labelVersion = grid.version
+        }
+        let known = label[start]
+        if known >= firstValidLabel { return component(known, touches: goal) }
+
+        reachGeneration &+= 1
+        if reachGeneration == 0 { reachStamp.update(repeating: 0); reachGeneration = 1 }
+        let gen = reachGeneration
+
+        var head = 0, tail = 0
+        reachStamp[start] = gen
+        // Packed (y << 16 | x): the queue carries the coordinates it already
+        // knows rather than making the next pop divide them back out.
+        reachQueue[tail] = Int32(bitPattern: UInt32((start / cols) << 16 | (start % cols)))
+        tail += 1
+
+        // Enqueue if unvisited and enterable. Reports the goal the moment it is
+        // touched — and the goal is exempt from the occupancy test exactly as it
+        // is in `route`, because a trace is allowed to land on copper there.
+        // Blocked cells get stamped too: they are never enqueued, but stamping
+        // them keeps the next neighbour that looks at them from testing again.
+        @inline(__always)
+        func step(_ ni: Int, _ nx: Int, _ ny: Int) -> Bool {
+            if ni == goal { return true }
+            if reachStamp[ni] == gen { return false }
+            reachStamp[ni] = gen
+            if grid.blockedAt(ni, r) { return false }
+            reachQueue[tail] = Int32(bitPattern: UInt32(ny << 16 | nx))
+            tail += 1
+            return false
+        }
+
+        while head < tail {
+            let packed = UInt32(bitPattern: reachQueue[head]); head += 1
+            let cx = Int(packed & 0xFFFF), cy = Int(packed >> 16)
+            let cur = cy * cols + cx
+            let up = cur - cols, down = cur + cols
+
+            if cx > 0, cy > 0, cx < cols - 1, cy < rows - 1 {
+                // The four orthogonal neighbours are also the four corner cells
+                // the diagonals have to test, so they are tested once here
+                // instead of twice more inside each diagonal case.
+                let bE = grid.blockedAt(cur + 1, r), bW = grid.blockedAt(cur - 1, r)
+                let bS = grid.blockedAt(down, r),    bN = grid.blockedAt(up, r)
+
+                if step(cur + 1, cx + 1, cy) { return true }
+                if step(cur - 1, cx - 1, cy) { return true }
+                if step(down, cx, cy + 1) { return true }
+                if step(up, cx, cy - 1) { return true }
+                if !bE && !bS, step(down + 1, cx + 1, cy + 1) { return true }
+                if !bW && !bS, step(down - 1, cx - 1, cy + 1) { return true }
+                if !bW && !bN, step(up - 1, cx - 1, cy - 1) { return true }
+                if !bE && !bN, step(up + 1, cx + 1, cy - 1) { return true }
+            } else {
+                // Edge cell: the same eight steps with the bounds tests the
+                // interior case is allowed to skip.
+                for di in 0..<8 {
+                    let dx = Router.dx(di), dy = Router.dy(di)
+                    let nx = cx + dx, ny = cy + dy
+                    if nx < 0 || ny < 0 || nx >= cols || ny >= rows { continue }
+                    if dx != 0 && dy != 0 {
+                        if grid.blocked(cx + dx, cy, r) || grid.blocked(cx, cy + dy, r) { continue }
+                    }
+                    if step(ny * cols + nx, nx, ny) { return true }
+                }
+            }
+        }
+
+        // Drained: everything enqueued is exactly one component and nothing
+        // routed out of it. Write that down for the probes still to come.
+        if nextLabel == .max {
+            label.update(repeating: 0)
+            nextLabel = 1
+            firstValidLabel = 1
+        }
+        let c = nextLabel
+        nextLabel &+= 1
+        for k in 0..<tail {
+            let packed = UInt32(bitPattern: reachQueue[k])
+            label[Int(packed >> 16) * cols + Int(packed & 0xFFFF)] = c
+        }
+        return false
+    }
+
+    /// Can a trace inside component `c` land on `goal`? Either the goal is in
+    /// it, or it is enterable from a cell that is — the goal being exempt from
+    /// the occupancy test, it may well be copper itself.
+    private func component(_ c: UInt32, touches goal: Int) -> Bool {
+        if label[goal] == c { return true }
+        let cols = grid.cols, rows = grid.rows
+        let gx = goal % cols, gy = goal / cols
+        for di in 0..<8 {
+            let dx = Router.dx(di), dy = Router.dy(di)
+            let nx = gx + dx, ny = gy + dy
+            if nx < 0 || ny < 0 || nx >= cols || ny >= rows { continue }
+            if label[ny * cols + nx] != c { continue }
+            // The same no-corner-cutting rule, at r = 0: a weaker test than the
+            // caller's own r can only accept more, and accepting more is free.
+            if dx != 0 && dy != 0 {
+                if grid.blocked(nx, gy, 0) || grid.blocked(gx, ny, 0) { continue }
+            }
+            return true
+        }
+        return false
+    }
+
     // MARK: - Route
 
     /// Returns the centreline in grid cells, or nil if no legal corridor of
@@ -154,6 +309,9 @@ final class Router {
         // trace had just landed on — produced traces starting exactly on top
         // of another trace.
         if start != goal && grid.blocked(Int(s.x), Int(s.y), r) { return nil }
+
+        // Nothing below can find a corridor the pre-pass says is not there.
+        if !reachable(from: start, to: goal, keepout: r) { return nil }
 
         generation &+= 1
         if generation == 0 {  // wrapped: stale stamps could alias
