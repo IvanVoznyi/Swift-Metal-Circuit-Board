@@ -190,11 +190,69 @@ final class Router {
 
     /// Directions that would turn 135 degrees or more away from `d`, as a bit
     /// per direction.
-    static let opposed: [UInt32] = (0..<8).map { d in
-        var m: UInt32 = 0
-        for k in 3...5 { m |= 1 << UInt32((d + k) & 7) }
-        return m
-    }
+    //
+    //   d = 0 (N)  -> SE, S,  SW  (bits 3,4,5) -> 0x38
+    //   d = 1 (NE) -> S,  SW, W   (bits 4,5,6) -> 0x70
+    //   d = 2 (E)  -> SW, W,  NW  (bits 5,6,7) -> 0xE0
+    //   d = 3 (SE) -> W,  NW, N   (bits 6,7,0) -> 0xC1
+    //   d = 4 (S)  -> NW, N,  NE  (bits 7,0,1) -> 0x83
+    //   d = 5 (SW) -> N,  NE, E   (bits 0,1,2) -> 0x07
+    //   d = 6 (W)  -> NE, E,  SE  (bits 1,2,3) -> 0x0E
+    //   d = 7 (NW) -> E,  SE, S   (bits 2,3,4) -> 0x1C
+    // Creates a lookup table of "opposed direction" masks.
+    //
+    // -----------------------------------------------------------------------------------------------
+    //   +   : Current grid cell
+    //  [d]  : Current heading
+    //  [X]  : Blocked (bit = 1)
+    //   .   : Allowed (bit = 0)
+    // -----------------------------------------------------------------------------------------------
+    // Only the three directions behind the current heading
+    // (135°, 180°, and 225°) are blocked.
+    //                                              N (0)
+    //                                                 ▲
+    //                                                 │
+    //                                    NW (7) ◄─────┼─────► NE (1)
+    //                                                 │
+    //                              W (6) ◄────────────┼────────────► E (2)
+    //                                                 │
+    //                                    SW (5) ◄─────┼─────► SE (3)
+    //                                                 │
+    //                                                 ▼
+    //                                              S (4)
+    //  +------------------ + ------------------------ + ------------------ + ---------------------- +
+    //  |  d = 0 (North)    |    d = 1 (North-East)    |    d = 2 (East)    |   d = 3 (South-East)   |
+    //  |                   |                          |                    |                        |
+    //  |    .  [d]  .      |         .   .  [d]       |     .   .   .      |        .   .   .       |
+    //  |    .   +   .      |        [X]  +   .        |    [X]  +  [d]     |       [X]  +   .       |
+    //  |   [X] [X] [X]     |        [X] [X]  .        |    [X] [X]  .      |        .  [X] [d]      |
+    //  |                   |                          |                    |                        |
+    //  |   Bits: 3,4,5     |       Bits: 4,5,6        |   Bits: 5,6,7      |      Bits: 6,7,0       |
+    //  |   Mask: 0x38      |       Mask: 0x70         |   Mask: 0xE0       |      Mask: 0xC1        |
+    //  |                   |                          |                    |                        |
+    //  + ----------------- + ------------------------ + -------------------+----------------------- +
+    //  |                   |                          |                    |                        |
+    //  |  d = 4 (South)    |    d = 5 (South-West)    |   d = 6 (West)     |    d = 7 (North-West)  |
+    //  |                   |                          |                    |                        |
+    //  |   [X] [X] [X]     |        .  [X] [X]        |    .   .  [X]      |      [d]  .   .        |
+    //  |    .   +   .      |       [d]  +  [X]        |   [d]  +  [X]      |       .   +  [X]       |
+    //  |    .  [d]  .      |        .   .   .         |    .   .   .       |       .  [X] [X]       |
+    //  |                   |                          |                    |                        |
+    //  |   Bits: 7,0,1     |       Bits: 0,1,2        |   Bits: 1,2,3      |      Bits: 2,3,4       |
+    //  |   Mask: 0x83      |       Mask: 0x07         |   Mask: 0x0E       |      Mask: 0x1C        |
+    //  + ----------------- + ------------------------ + ------------------ + ---------------------- +
+    // A set bit (1) means the direction is considered "opposed" and may be
+    // skipped by the router. The remaining five directions stay available.
+    static let opposed: [UInt32] = [
+        0x38, // N
+        0x70, // NE
+        0xE0, // E
+        0xC1, // SE
+        0x83, // S
+        0x07, // SW
+        0x0E, // W
+        0x1C  // NW
+    ]
 
     /// Turn magnitude between two of the eight directions, in 45 degree steps.
     @inline(__always) static func turnSteps(_ a: Int, _ b: Int) -> Int {
