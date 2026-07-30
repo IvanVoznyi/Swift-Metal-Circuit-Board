@@ -142,11 +142,62 @@ final class Router {
 
     /// The eight octile steps, clockwise, as functions rather than a global
     /// array — the innermost loop should not index a heap-allocated table.
-    @inline(__always) static func dx(_ i: Int) -> Int {
-        switch i { case 0, 1, 7: return 1; case 3, 4, 5: return -1; default: return 0 }
+
+    // -------------------------------------------------------------------------------------------------------------------------
+    //  Direction lookup tables used by dx(i) and dy(i)
+    //
+    //      Index      Direction      dx(i)      dy(i)
+    //      ------------------------------------------------
+    //         5            NW          -1         -1
+    //         6             N           0         -1
+    //         7            NE          +1         -1
+    //         4             W          -1          0
+    //         0             E          +1          0
+    //         3            SW          -1         +1
+    //         2             S           0         +1
+    //         1            SE          +1         +1
+    //
+    //                 dx = -1            dx = 0             dx = +1
+    //              ┌──────────────────┬──────────────────┬──────────────────┐
+    //      dy = -1 │  Index 5 (NW)    │  Index 6 (N)     │  Index 7 (NE)    │
+    //              │  dx = -1         │  dx =  0         │  dx = +1         │
+    //              │  dy = -1         │  dy = -1         │  dy = -1         │
+    //              ├──────────────────┼──────────────────┼──────────────────┤
+    //      dy =  0 │  Index 4 (W)     │      CELL        │  Index 0 (E)     │
+    //              │  dx = -1         │                  │  dx = +1         │
+    //              │  dy =  0         │                  │  dy =  0         │
+    //              ├──────────────────┼──────────────────┼──────────────────┤
+    //      dy = +1 │  Index 3 (SW)    │  Index 2 (S)     │  Index 1 (SE)    │
+    //              │  dx = -1         │  dx =  0         │  dx = +1         │
+    //              │  dy = +1         │  dy = +1         │  dy = +1         │
+    //              └──────────────────┴──────────────────┴──────────────────┘
+    //
+    //  Direction index order (clockwise):
+    //
+    //                 5 ───── 6 ───── 7
+    //                 │               │
+    //                 │               │
+    //                 4     CELL      0
+    //                 │               │
+    //                 │               │
+    //                 3 ───── 2 ───── 1
+    //
+    //  Therefore:
+    //
+    //      dx = ( +1, +1,  0, -1, -1, -1,  0, +1 )
+    //      dy = (  0, +1, +1, +1,  0, -1, -1, -1 )
+    // -------------------------------------------------------------------------------------------------------------------------
+    
+    @inline(__always)
+    static func dx(_ i: Int) -> Int {
+        let table = (1, 1, 0, -1, -1, -1, 0, 1)
+        return withUnsafeBytes(of: table) { $0.bindMemory(to: Int.self)[i & 7] }
     }
-    @inline(__always) static func dy(_ i: Int) -> Int {
-        switch i { case 1, 2, 3: return 1; case 5, 6, 7: return -1; default: return 0 }
+    
+    @inline(__always)
+    static func dy(_ i: Int) -> Int {
+        let table = (0, 1, 1, 1, 0, -1, -1, -1)
+        return withUnsafeBytes(of: table) { $0.bindMemory(to: Int.self)[i & 7] }
     }
 
     // MARK: - Open list
@@ -154,15 +205,15 @@ final class Router {
     // chosen path among equal-cost routes, is reproducible.
 
     @inline(__always)
-    private func enqueue(_ f: Float, _ v: Int32) {
+    private func enqueue(_ cost: Float, _ nodeCellIndex: Int32) {
         guard entryCount < heapCapacity else { return }
-        var b = Int(f / Router.bucketWidth)
+        var b = Int(cost / Router.bucketWidth)
         // Never behind the scan, and never more than one lap ahead of it.
         if b < scanBucket { b = scanBucket }
         if b >= scanBucket + Router.bucketCount { b = scanBucket + Router.bucketCount - 1 }
         let slot = b & (Router.bucketCount - 1)
         let e = entryCount
-        entryCell[e] = v
+        entryCell[e] = nodeCellIndex
         entryNext[e] = bucketHead[slot]
         bucketHead[slot] = Int32(e)
         entryCount += 1
@@ -194,59 +245,69 @@ final class Router {
     /// Each bit in the UInt32 mask corresponds to one of the 8 grid directions (0 to 7).
     /// When a bit is set to 1, that direction is blocked, preventing the pathfinder
     /// from making sharp backtracking or U-turn movements relative to its current heading.
+    // For each current heading d, the three directions behind it
+    // (225°, 180°, and 135° relative to the heading) are marked as
+    // "opposed" by setting their bits to 1.
     //
-    //   d = 0 (N)  -> SE, S,  SW  (bits 3,4,5) -> 0x38
-    //   d = 1 (NE) -> S,  SW, W   (bits 4,5,6) -> 0x70
-    //   d = 2 (E)  -> SW, W,  NW  (bits 5,6,7) -> 0xE0
-    //   d = 3 (SE) -> W,  NW, N   (bits 6,7,0) -> 0xC1
-    //   d = 4 (S)  -> NW, N,  NE  (bits 7,0,1) -> 0x83
-    //   d = 5 (SW) -> N,  NE, E   (bits 0,1,2) -> 0x07
-    //   d = 6 (W)  -> NE, E,  SE  (bits 1,2,3) -> 0x0E
-    //   d = 7 (NW) -> E,  SE, S   (bits 2,3,4) -> 0x1C
-    // Creates a lookup table of "opposed direction" masks.
+    //  d = 0 (E)  -> W,  NW, N   (bits 4,5,6) -> 0x70
+    //  d = 1 (SE) -> NW, N,  NE  (bits 5,6,7) -> 0xE0
+    //  d = 2 (S)  -> N,  NE, E   (bits 6,7,0) -> 0xC1
+    //  d = 3 (SW) -> NE, E,  SE  (bits 7,0,1) -> 0x83
+    //  d = 4 (W)  -> E,  SE, S   (bits 0,1,2) -> 0x07
+    //  d = 5 (NW) -> SE, S,  SW  (bits 1,2,3) -> 0x0E
+    //  d = 6 (N)  -> S,  SW, W   (bits 2,3,4) -> 0x1C
+    //  d = 7 (NE) -> SW, W,  NW  (bits 3,4,5) -> 0x38
     //
     // -----------------------------------------------------------------------------------------------
-    //   +   : Current grid cell
-    //  [d]  : Current heading
-    //  [X]  : Blocked (bit = 1)
-    //   .   : Allowed (bit = 0)
+    // [d] = Current heading
+    // [X] = Opposed direction (bit = 1)
+    //  .  = Allowed direction (bit = 0)
     // -----------------------------------------------------------------------------------------------
-    // Only the three directions behind the current heading
-    // (135°, 180°, and 225°) are blocked.
-    //                                              N (0)
-    //                                                 ▲
-    //                                                 │
-    //                                    NW (7) ◄─────┼─────► NE (1)
-    //                                                 │
-    //                              W (6) ◄────────────┼────────────► E (2)
-    //                                                 │
-    //                                    SW (5) ◄─────┼─────► SE (3)
-    //                                                 │
-    //                                                 ▼
-    //                                              S (4)
-    //  +------------------ + ------------------------ + ------------------ + ---------------------- +
-    //  |  d = 0 (North)    |    d = 1 (North-East)    |    d = 2 (East)    |   d = 3 (South-East)   |
-    //  |                   |                          |                    |                        |
-    //  |    .  [d]  .      |         .   .  [d]       |     .   .   .      |        .   .   .       |
-    //  |    .   +   .      |        [X]  +   .        |    [X]  +  [d]     |       [X]  +   .       |
-    //  |   [X] [X] [X]     |        [X] [X]  .        |    [X] [X]  .      |        .  [X] [d]      |
-    //  |                   |                          |                    |                        |
-    //  |   Bits: 3,4,5     |       Bits: 4,5,6        |   Bits: 5,6,7      |      Bits: 6,7,0       |
-    //  |   Mask: 0x38      |       Mask: 0x70         |   Mask: 0xE0       |      Mask: 0xC1        |
-    //  |                   |                          |                    |                        |
-    //  + ----------------- + ------------------------ + -------------------+----------------------- +
-    //  |                   |                          |                    |                        |
-    //  |  d = 4 (South)    |    d = 5 (South-West)    |   d = 6 (West)     |    d = 7 (North-West)  |
-    //  |                   |                          |                    |                        |
-    //  |   [X] [X] [X]     |        .  [X] [X]        |    .   .  [X]      |      [d]  .   .        |
-    //  |    .   +   .      |       [d]  +  [X]        |   [d]  +  [X]      |       .   +  [X]       |
-    //  |    .  [d]  .      |        .   .   .         |    .   .   .       |       .  [X] [X]       |
-    //  |                   |                          |                    |                        |
-    //  |   Bits: 7,0,1     |       Bits: 0,1,2        |   Bits: 1,2,3      |      Bits: 2,3,4       |
-    //  |   Mask: 0x83      |       Mask: 0x07         |   Mask: 0x0E       |      Mask: 0x1C        |
-    //  + ----------------- + ------------------------ + ------------------ + ---------------------- +
-    // A set bit (1) means the direction is considered "opposed" and may be
-    // skipped by the router. The remaining five directions stay available.
+    //                                 Direction index mapping used throughout the router:
+    //
+    //                                                dx=-1           dx=0           dx=+1
+    //                                            ┌────────────┬────────────┬────────────┐
+    //                                dy = -1     │ NW (5)     │ N  (6)     │ NE (7)     │
+    //                                            ├────────────┼────────────┼────────────┤
+    //                                dy =  0     │ W  (4)     │  (CELL)    │ E  (0)     │
+    //                                            ├────────────┼────────────┼────────────┤
+    //                                dy = +1     │ SW (3)     │ S  (2)     │ SE (1)     │
+    //                                            └────────────┴────────────┴────────────┘
+    // ┌──────────────────────────────┬──────────────────────────────┬──────────────────────────────┬──────────────────────────────┐
+    // │         d = 0 (E)            │        d = 1 (SE)            │         d = 2 (S)            │        d = 3 (SW)            │
+    // │                              │                              │                              │                              │
+    // │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │
+    // │ │  [X]   │  [d]   │   .    │ │ │  [X]   │  [X]   │  [d]   │ │ │  [X]   │  [X]   │  [X]   │ │ │   .    │  [X]   │  [X]   │ │
+    // │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │
+    // │ │  [X]   │ (Cell) │   .    │ │ │  [X]   │ (Cell) │   .    │ │ │   .    │ (Cell) │  [d]   │ │ │   .    │ (Cell) │  [X]   │ │
+    // │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │
+    // │ │  [X]   │   .    │   .    │ │ │   .    │   .    │   .    │ │ │   .    │   .    │   .    │ │ │   .    │   .    │  [d]   │ │
+    // │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │
+    // │ Bits: 3,4,5                  │ Bits: 4,5,6                  │ Bits: 5,6,7                  │ Bits: 6,7,0                  │
+    // | Byte : [ 0 0 1 1 1 0 0 0 ]   | Byte : [ 0 1 1 1 0 0 0 0 ]   | Byte : [ 1 1 1 0 0 0 0 0 ]   | Byte : [ 1 1 0 0 0 0 0 1 ]   |
+    // |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |
+    // |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |
+    // │ Mask: 0x38                   │ Mask: 0x70                   │ Mask: 0xE0                   │ Mask: 0xC1                   │
+    // ├──────────────────────────────┼──────────────────────────────┼──────────────────────────────┼──────────────────────────────┤
+    // │         d = 4 (W)            │        d = 5 (NW)            │         d = 6 (N)            │        d = 7 (NE)            │
+    // │                              │                              │                              │                              │
+    // │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │ ┌────────┬────────┬────────┐ │
+    // │ │   .    │   .    │  [X]   │ │ │   .    │   .    │   .    │ │ │   .    │   .    │   .    │ │ │  [d]   │   .    │   .    │ │
+    // │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │
+    // │ │   .    │ (Cell) │  [X]   │ │ │   .    │ (Cell) │  [X]   │ │ │  [d]   │ (Cell) │   .    │ │ │  [X]   │ (Cell) │   .    │ │
+    // │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │ ├────────┼────────┼────────┤ │
+    // │ │   .    │  [d]   │  [X]   │ │ │  [d]   │  [X]   │  [X]   │ │ │  [X]   │  [X]   │  [X]   │ │ │  [X]   │  [X]   │   .    │ │
+    // │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │ └────────┴────────┴────────┘ │
+    // │ Bits: 7,0,1                  │ Bits: 0,1,2                  │ Bits: 1,2,3                  │ Bits: 2,3,4                  │
+    // | Byte : [ 1 0 0 0 0 0 1 1 ]   | Byte : [ 0 0 0 0 0 1 1 1 ]   | Byte : [ 0 0 0 0 1 1 1 0 ]   | Byte : [ 0 0 0 1 1 1 0 0 ]   |
+    // |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |          │ │ │ │ │ │ │ │     |
+    // |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |          7 6 5 4 3 2 1 0     |
+    // │ Mask: 0x83                   │ Mask: 0x07                   │ Mask: 0x0E                   │ Mask: 0x1C                   │
+    // └──────────────────────────────┴──────────────────────────────┴──────────────────────────────┴──────────────────────────────┘
+    //
+    // A set bit (1) means that direction is considered "opposed"
+    // to the current heading and may be skipped by the router.
+    //
     static let opposed: [UInt32] = [
         0x38, // N
         0x70, // NE
@@ -335,54 +396,50 @@ final class Router {
     //    - Enables candidate neighbor steps to validate directional legality with a single bitwise test (`(forbiddenMask & (1 << candidateDir)) != 0`),
     //      eliminating costly branching logic inside the inner pathfinding loop.
     // -------------------------------------------------------------------------------------------------------------------------
-    //  spikeWindow = 3
+    //  spikeWindow = 3                                                   Direction index order (clockwise):
+    //                                 ┌────────┬────────┬────────┐               5 ───── 6 ───── 7
+    //                                 │   NW   │   N    │   NE   │               │               │
+    //                                 ├────────┼────────┼────────┤               │               │
+    //                                 │   W    │ (Cell) │   E    │               4     CELL      0
+    //                                 ├────────┼────────┼────────┤               │               │
+    //                                 │   SW   │   S    │   SE   │               │               │
+    //                                 └────────┴────────┴────────┘               3 ───── 2 ───── 1
     // -------------------------------------- + -------------------------------------- + -------------------------------------- +
-    //           recentDirs[cur]              |            recentDirs[cur]             |                recentDirs[cur]         |
+    //            recentDirs[cur]             |            recentDirs[cur]             |            recentDirs[cur]             |
     //    +------+------+------+------+       |    +------+------+------+------+       |    +------+------+------+------+       |
     //    |  N   |  NE  |  E   | 0xF  |       |    |  N   |  NE  |  E   | 0xF  |       |    |  N   |  NE  |  E   | 0xF  |       |
     //    +------+------+------+------+       |    +------+------+------+------+       |    +------+------+------+------+       |
-    //       d0      d1     d2   empty        |       d0      d1     d2   empty        |       d0      d1     d2   empty        |
-    //       ^                                |               ^                        |                      ^                 |
-    //       │                                |               │                        |                      │                 |
-    //       └──────────────┐                 |               └──────┐                 |                      │                 |
-    //                      │                 |                      │                 |                      |                 |
-    //                      ▼                 |                      ▼                 |                      ▼                 |
-    //            heading = h & 0xF           |            heading = h & 0xF           |            heading = h & 0xF           |
+    //       d0     d1     d2   empty         |       d0     d1     d2   empty         |       d0     d1     d2   empty         |
+    //       ^                                |              ^                         |                     ^                  |
+    //       │                                |              │                         |                     │                  |
+    //       └──────────────┐                 |              └──────┐                  |                     │                  |
+    //                      │                 |                     │                  |                     │                  |
+    //                      ▼                 |                     ▼                  |                     ▼                  |
+    //            heading = h & 0xF           |           heading = h & 0xF            |           heading = h & 0xF            |
     // -------------------------------------- + -------------------------------------- + -------------------------------------- +
-    //            Heading = N                 |            Heading = NE                |            Heading = E                 |
+    //            Heading = N                 |           Heading = NE                 |           Heading = E                  |
     //                                        |                                        |                                        |
-    //               N                        |               N                        |               N                        |
-    //           NW  │  NE                    |           NW  │  NE                    |           NW  │  NE                    |
-    //               │                        |               │                        |               │                        |
-    //        W ──── + ──── E                 |        W ──── + ──── E                 |        W ──── + ──── E                 |
-    //               │                        |               │                        |               │                        |
-    //           SW  │  SE                    |           SW  │  SE                    |           SW  │  SE                    |
-    //               S                        |               S                        |               S                        |
+    //     ┌────────┬────────┬────────┐       |     ┌────────┬────────┬────────┐       |    ┌────────┬────────┬────────┐        |
+    //     │  [X]   │   .    │   .    │       |     │  [X]   │  [X]   │   .    │       |    │  [X]   │  [X]   │  [X]   │        |
+    //     ├────────┼────────┼────────┤       |     ├────────┼────────┼────────┤       |    ├────────┼────────┼────────┤        |
+    //     │  [X]   │ (Cell) │  [d]   │       |     │  [X]   │ (Cell) │   .    │       |    │   .    │ (Cell) │  [d]   │        |
+    //     ├────────┼────────┼────────┤       |     ├────────┼────────┼────────┤       |    ├────────┼────────┼────────┤        |
+    //     │  [X]   │   .    │   .    │       |     │   .    │   .    │  [d]   │       |    │   .    │   .    │   .    │        |
+    //     └────────┴────────┴────────┘       |     └────────┴────────┴────────┘       |    └────────┴────────┴────────┘        |
     //                                        |                                        |                                        |
-    //               │                        |               │                        |               │                        |
-    //               │ opposed[N]             |               │ opposed[NE]            |               │ opposed[E]             |
-    //               ▼                        |               ▼                        |               ▼                        |
-    //                                        |                                        |                                        |
-    //               .                        |               .                        |               .                        |
-    //           .   │   .                    |           .   │   .                    |           X   │   .                    |
-    //               │                        |               │                        |               │                        |
-    //        . ──── + ──── .                 |        X ──── + ──── .                 |        X ──── + ──── .                 |
-    //               │                        |               │                        |               │                        |
-    //           X   │   X                    |           X   │   .                    |           X   │   .                    |
-    //               X                        |               X                        |               .                        |
-    //                                        |                                        |                                        |
-    //      Mask = 00111000 (0x38)            |      Mask = 01110000 (0x70)            |      Mask = 11100000 (0xE0)            |
+    //     Mask : 0 0 1 1 1 0 0 0  (0x38)     |     Byte : 0 1 1 1 0 0 0 0  (0x70)     |    Byte : 1 1 1 0 0 0 0 0  (0xE0)      |
+    //     Bits : 7 6 5 4 3 2 1 0             |     Bits : 7 6 5 4 3 2 1 0             |    Bits : 7 6 5 4 3 2 1 0              |
     //                                        |                                        |                                        |
     // -------------------------------------- + -------------------------------------- + -------------------------------------- +
-    //                                        |                 Result                 |                                        |
+    //                                        |                Result                  |                                        |
     // -------------------------------------- + -------------------------------------- + -------------------------------------- +
-    //               Bitwise OR               |         N                    .         |  Bit:        7  6  5  4  3  2  1  0    |
-    //                                        |     NW  │  NE            X   │   .     |              │  │  │  │  │  │  │  │    |
-    //                00111000                |         │                    │         |  Mask:       1  1  1  1  1  0  0  0    |
-    //          OR    01110000                |  W ──── + ──── E ===> X ──── + ──── .  |  Direction: NW  W  SW S  SE E  NE N    |
-    //          OR    11100000                |         │                    │         |                                        |
-    //          ----------------              |    SW   │   SE          X    │   X     |  Allowed:    N, NE, E                  |
-    //                11111000                |         S                    X         |  Blocked:    NW, W, SW, S, SE          |
+    //              Bitwise OR                |    ┌────────┬────────┬────────┐        |  Mask:       1  1  1  1  1  0  0  0    |
+    //                                        |    │  [X]   │  [X]   │  [X]   │        |              │  │  │  │  │  │  │  │    |
+    //         00111000   (0x38)              |    ├────────┼────────┼────────┤        |  Bits:       7  6  5  4  3  2  1  0    |
+    //      OR 01110000   (0x70)              |    │  [X]   │ (Cell) │   .    │        |  Direction: NW  W SW  S SE  E NE  N    |
+    //      OR 11100000   (0xE0)              |    ├────────┼────────┼────────┤        |                                        |
+    //      --------------------              |    │  [X]   │   .    │   .    │        |  Allowed:    E, SE, S                  |
+    //         11111000   (0xF8)              |    └────────┴────────┴────────┘        |  Blocked:    NE, N, NW, W, SW          |
     //                                        |                                        |                                        |
     // -------------------------------------- + -------------------------------------- + -------------------------------------- +
     @inline(__always)
