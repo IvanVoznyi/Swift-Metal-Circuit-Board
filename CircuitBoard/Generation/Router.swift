@@ -188,8 +188,12 @@ final class Router {
     /// Every nibble a sentinel: a path with nothing behind it yet.
     static let noHistory: UInt32 = Router.historyMask
 
-    /// Directions that would turn 135 degrees or more away from `d`, as a bit
-    /// per direction.
+    /// Precomputed bitmasks representing the "rear blindspot" (135°, 180°, and 225°
+    /// reverse angles) for each of the 8 compass directions.
+    ///
+    /// Each bit in the UInt32 mask corresponds to one of the 8 grid directions (0 to 7).
+    /// When a bit is set to 1, that direction is blocked, preventing the pathfinder
+    /// from making sharp backtracking or U-turn movements relative to its current heading.
     //
     //   d = 0 (N)  -> SE, S,  SW  (bits 3,4,5) -> 0x38
     //   d = 1 (NE) -> S,  SW, W   (bits 4,5,6) -> 0x70
@@ -254,31 +258,152 @@ final class Router {
         0x1C  // NW
     ]
 
-    /// Turn magnitude between two of the eight directions, in 45 degree steps.
-    @inline(__always) static func turnSteps(_ a: Int, _ b: Int) -> Int {
-        let raw = abs(a - b)
-        return raw > 4 ? 8 - raw : raw
-    }
-
-    /// Directions that would double the line back on itself, given where it has
-    /// been for the last few cells.
-    ///
-    /// The window is what the eye reads as one place — six cells, the ~44 px a
-    /// wedge spans before it stops looking like a kink and starts looking like a
-    /// turn. A drawn segment is a whole run of same-direction cells, so two
-    /// vertices of the drawn line can be five cells apart; a shorter window
-    /// misses exactly the shape this is here to forbid, and a wider one starts
-    /// refusing honest detours.
+    // --- The Octile Turn Step Distance Calculator (Shortest Angular Delta) ---
+    // Calculates the minimum discrete turn steps required to transition between two 8-way directional indices (0 through 7).
+    // Replaces expensive floating-point trigonometric calculations (like atan2 or acos) with ultra-fast scalar modular
+    // arithmetic to compute directional turn penalties instantly during path finding.
+    //
+    // 1. Angular Index Representation:
+    //    - The 8 movement directions are mapped sequentially from 0 through 7 around the circle in 45-degree steps.
+    //    - One turn step equals a 45-degree shift (e.g., direct move to gentle turn).
+    //    - Two turn steps equal 90 degrees, three equal 135 degrees, and four equal a full 180-degree reversal.
+    //
+    // 2. Circular Wrap-Around Correction:
+    //    - Simple absolute subtraction `abs(a - b)` fails across the 0/7 index boundary (e.g., from North-East [7] to East [0]).
+    //    - If the raw delta exceeds 4 steps (180 degrees), taking the opposite circular arc `8 - raw` yields the true
+    //      shortest turn distance (e.g., a raw difference of 7 steps across the boundary simplifies to 1 step).
+    //
+    // 3. Performance Inlining (@inline(__always)):
+    //    - Marking this function for mandatory inlining allows the Swift compiler to insert the simple arithmetic logic
+    //      directly into hot pathfinding loops, eliminating function call overhead during millions of neighbor evaluations.
+    //
+    // ------------------------------------------------------------------------------------
+    //
+    //    [ DIRECTION KEY ]
+    //    0 = North (0°)       2 = East (90°)       4 = South (180°)     6 = West (270°)
+    //    1 = Northeast (45°)  3 = Southeast (135°) 5 = Southwest (225°) 7 = Northwest (315°)
+    //
+    //    --------------------------------------------------------------------------------
+    //    [ TURN STEPS LOOKUP TABLE ]
+    //    Rows = Starting Direction (a) | Columns = Target Direction (b)
+    //    --------------------------------------------------------------------------------
+    //           |  0(N)  1(NE)  2(E)  3(SE)  4(S)  5(SW)  6(W)  7(NW)
+    //    ------ + -------------------------------------------------
+    //      0(N) |   0      1     2     3      4     3     2     1
+    //      1(NE)|   1      0     1     2      3     4     3     2
+    //      2(E) |   2      1     0     1      2     3     4     3
+    //      3(SE)|   3      2     1     0      1     2     3     4
+    //      4(S) |   4      3     2     1      0     1     2     3
+    //      5(SW)|   3      4     3     2      1     0     1     2
+    //      6(W) |   2      3     4     3      2     1     0     1
+    //      7(NW)|   1      2     3     4      3     2     1     0
+    //
+    //    --------------------------------------------------------------------------------
+    //    [ WHAT THE VALUES MEAN & MOVEMENT RULES ]
+    //    --------------------------------------------------------------------------------
+    //    Value | Angle Diff | Description           | Blocked Status (If applicable)
+    //    ----- + ---------- + --------------------- + ----------------------------
+    //      0   |    0°      | No turn / Straight    | Allowed
+    //      1   |   45°      | Slight turn / Diagonal| Allowed
+    //      2   |   90°      | Perpendicular turn    | Allowed
+    //      3   |  135°      | Sharp turn            | BLOCKED (Also covers 225° wrap)
+    //      4   |  180°      | U-turn / Opposite     | BLOCKED
+    //    --------------------------------------------------------------------------------
+    //    Turns from 0° to 90° are fully allowed
     @inline(__always)
-    private func forbiddenDirections(_ history: UInt32) -> UInt32 {
-        var h = history
-        var mask: UInt32 = 0
+    static func turnSteps(_ originDirectionIndex: Int, _ targetDirectionIndex: Int) -> Int {
+        let rawIndexDifference = abs(originDirectionIndex - targetDirectionIndex)
+        return rawIndexDifference > 4 ? 8 - rawIndexDifference : rawIndexDifference
+    }
+    
+    // --- The Directional History Bitmask Filter (Spike & Reversal Suppression Engine) ---
+    // Scans the recent directional history of a path node to extract a combined bitmask of all forbidden directions.
+    // By evaluating recent steps stored in a nibble-packed history variable, this method blocks path movements
+    // that would cause sharp back-turns, U-turns, or tight zigzagging loops within a specified step window.
+    //
+    // 1. Nibble-Packed History Unrolling:
+    //    - Reads directional history from a 32-bit bitmask (`history`) where each 4-bit segment (nibble) stores an 8-way directional index (0 through 7).
+    //    - Unrolls the history step-by-step using cheap bitwise shifts (`h >>= 4`) and bitmasks (`h & 0xF`), inspecting up to `Routing.spikeWindow` previous steps.
+    //
+    // 2. Sentinel Check & Mask Accumulation:
+    //    - Compares each extracted direction index against the sentinel value `0xF` (which flags an uninitialized or empty history slot).
+    //    - For every valid directional step found, looks up its opposed direction bitmask in `Router.opposedDirectionMasks` (covering 135-degree to 180-degree back-turns)
+    //      and merges it into the cumulative `forbiddenMask` via bitwise OR (`|=`).
+    //
+    // 3. Early Turn Pruning in Pathfinding Loops:
+    //    - Returns a single 32-bit bitmask where each set bit represents an illegal directional choice for the candidate step.
+    //    - Enables candidate neighbor steps to validate directional legality with a single bitwise test (`(forbiddenMask & (1 << candidateDir)) != 0`),
+    //      eliminating costly branching logic inside the inner pathfinding loop.
+    // -------------------------------------------------------------------------------------------------------------------------
+    //  spikeWindow = 3
+    // -------------------------------------- + -------------------------------------- + -------------------------------------- +
+    //           recentDirs[cur]              |            recentDirs[cur]             |                recentDirs[cur]         |
+    //    +------+------+------+------+       |    +------+------+------+------+       |    +------+------+------+------+       |
+    //    |  N   |  NE  |  E   | 0xF  |       |    |  N   |  NE  |  E   | 0xF  |       |    |  N   |  NE  |  E   | 0xF  |       |
+    //    +------+------+------+------+       |    +------+------+------+------+       |    +------+------+------+------+       |
+    //       d0      d1     d2   empty        |       d0      d1     d2   empty        |       d0      d1     d2   empty        |
+    //       ^                                |               ^                        |                      ^                 |
+    //       │                                |               │                        |                      │                 |
+    //       └──────────────┐                 |               └──────┐                 |                      │                 |
+    //                      │                 |                      │                 |                      |                 |
+    //                      ▼                 |                      ▼                 |                      ▼                 |
+    //            heading = h & 0xF           |            heading = h & 0xF           |            heading = h & 0xF           |
+    // -------------------------------------- + -------------------------------------- + -------------------------------------- +
+    //            Heading = N                 |            Heading = NE                |            Heading = E                 |
+    //                                        |                                        |                                        |
+    //               N                        |               N                        |               N                        |
+    //           NW  │  NE                    |           NW  │  NE                    |           NW  │  NE                    |
+    //               │                        |               │                        |               │                        |
+    //        W ──── + ──── E                 |        W ──── + ──── E                 |        W ──── + ──── E                 |
+    //               │                        |               │                        |               │                        |
+    //           SW  │  SE                    |           SW  │  SE                    |           SW  │  SE                    |
+    //               S                        |               S                        |               S                        |
+    //                                        |                                        |                                        |
+    //               │                        |               │                        |               │                        |
+    //               │ opposed[N]             |               │ opposed[NE]            |               │ opposed[E]             |
+    //               ▼                        |               ▼                        |               ▼                        |
+    //                                        |                                        |                                        |
+    //               .                        |               .                        |               .                        |
+    //           .   │   .                    |           .   │   .                    |           X   │   .                    |
+    //               │                        |               │                        |               │                        |
+    //        . ──── + ──── .                 |        X ──── + ──── .                 |        X ──── + ──── .                 |
+    //               │                        |               │                        |               │                        |
+    //           X   │   X                    |           X   │   .                    |           X   │   .                    |
+    //               X                        |               X                        |               .                        |
+    //                                        |                                        |                                        |
+    //      Mask = 00111000 (0x38)            |      Mask = 01110000 (0x70)            |      Mask = 11100000 (0xE0)            |
+    //                                        |                                        |                                        |
+    // -------------------------------------- + -------------------------------------- + -------------------------------------- +
+    //                                        |                 Result                 |                                        |
+    // -------------------------------------- + -------------------------------------- + -------------------------------------- +
+    //               Bitwise OR               |         N                    .         |  Bit:        7  6  5  4  3  2  1  0    |
+    //                                        |     NW  │  NE            X   │   .     |              │  │  │  │  │  │  │  │    |
+    //                00111000                |         │                    │         |  Mask:       1  1  1  1  1  0  0  0    |
+    //          OR    01110000                |  W ──── + ──── E ===> X ──── + ──── .  |  Direction: NW  W  SW S  SE E  NE N    |
+    //          OR    11100000                |         │                    │         |                                        |
+    //          ----------------              |    SW   │   SE          X    │   X     |  Allowed:    N, NE, E                  |
+    //                11111000                |         S                    X         |  Blocked:    NW, W, SW, S, SE          |
+    //                                        |                                        |                                        |
+    // -------------------------------------- + -------------------------------------- + -------------------------------------- +
+    @inline(__always)
+    private func forbiddenDirectionsMask(_ directionalHistory: UInt32) -> UInt32 {
+        var shiftableHistory = directionalHistory
+        var cumulativeForbiddenMask: UInt32 = 0
+        
+        // Iterate through nibbles across the active spike window
         for _ in 0..<Routing.spikeWindow {
-            let d = h & 0xF
-            if d != 0xF { mask |= Router.opposed[Int(d)] }
-            h >>= 4
+            let directionIndex = shiftableHistory & 0xF
+            
+            // Skip unset/sentinel history nibbles (0xF)
+            if directionIndex != 0xF {
+                cumulativeForbiddenMask |= Router.opposed[Int(directionIndex)]
+            }
+            
+            // Shift to inspect the previous 4-bit directional step
+            shiftableHistory >>= 4
         }
-        return mask
+        
+        return cumulativeForbiddenMask
     }
 
     // MARK: - Reachability
@@ -481,7 +606,7 @@ final class Router {
             let cd = Int(dirOf[cur])
             let curG = gScore[cur]
             let history = recentDirs[cur]
-            let forbidden = forbiddenDirections(history)
+            let forbidden = forbiddenDirectionsMask(history)
 
             for di in 0..<8 {
                 let dx = Router.dx(di), dy = Router.dy(di)
