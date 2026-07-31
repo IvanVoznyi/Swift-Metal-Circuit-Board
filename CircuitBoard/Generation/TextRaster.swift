@@ -13,12 +13,18 @@ enum TextRaster {
 
     /// Advance width of a string, the equivalent of `measureText(str).width`.
     static func width(_ text: String, size: CGFloat, bold: Bool = false) -> Float {
-        let f = font(size: size, bold: bold)
+        width(text, font: font(size: size, bold: bold))
+    }
+
+    /// The same, for a caller that already holds the font. Building a `CTFont`
+    /// is not free, and the rasteriser needs one anyway.
+    static func width(_ text: String, font f: CTFont) -> Float {
         var glyphs = [CGGlyph](repeating: 0, count: text.utf16.count)
         let chars = Array(text.utf16)
         guard CTFontGetGlyphsForCharacters(f, chars, &glyphs, chars.count) else {
-            // Fall back to the nominal monospace advance.
-            return Float(size) * 0.6 * Float(text.count)
+            // Fall back to the nominal monospace advance. `CTFontGetSize`
+            // returns exactly the size the font was created with.
+            return Float(CTFontGetSize(f)) * 0.6 * Float(text.count)
         }
         var advances = [CGSize](repeating: .zero, count: glyphs.count)
         CTFontGetAdvancesForGlyphs(f, .horizontal, glyphs, &advances, glyphs.count)
@@ -50,42 +56,34 @@ enum TextRaster {
         }
     }
 
-    /// The rasterised bitmap on its own. It depends on the string, the size and
-    /// the weight — never on where the label sits — so it is worth keeping.
-    struct Bitmap {
+    /// A string turned into pixels, with the font metrics that produced them.
+    ///
+    /// The one place in the project that draws text into a bitmap. Both users —
+    /// the label lattice here and the silkscreen atlas in `GlyphAtlas` — need
+    /// the identical Core Text sequence and differ only in the margin they want
+    /// and in where they consider the box's origin to be, so `pad` is a
+    /// parameter and the metrics come back for the caller to place with.
+    struct Raster {
         let width: Int
         let height: Int
-        let ascent: Float
-        let pad: Float
+        let advance: CGFloat
+        let ascent: CGFloat
+        let descent: CGFloat
+        let pad: CGFloat
         let alpha: [UInt8]
+
+        /// Canvas' `textBaseline = 'middle'`, from metrics already in hand.
+        var middleBaselineOffset: Float { Float((ascent - descent) / 2) }
     }
 
-    /// `coverage` split in two: the expensive half, which caches.
-    static func bitmap(_ text: String, size: CGFloat, bold: Bool) -> Bitmap? {
-        guard let c = coverage(text, size: size, bold: bold, x: 0, y: 0) else { return nil }
+    /// Generous vertical margin: Menlo's ascent plus a pixel of AA fringe.
+    private static let labelPad: CGFloat = 3
+
+    static func raster(_ text: String, size: CGFloat, bold: Bool, pad: CGFloat) -> Raster? {
         let f = font(size: size, bold: bold)
-        return Bitmap(width: c.width, height: c.height,
-                      ascent: Float(CTFontGetAscent(f)), pad: 3, alpha: c.alpha)
-    }
-
-    /// …and the cheap half, which just places it.
-    static func place(_ b: Bitmap, text: String, size: CGFloat, bold: Bool,
-                      x: Float, y: Float) -> Coverage {
-        let baselineY = y + middleBaselineOffset(size: size, bold: bold)
-        return Coverage(width: b.width, height: b.height,
-                        originX: x - b.pad,
-                        originY: baselineY - (b.ascent + b.pad),
-                        alpha: b.alpha)
-    }
-
-    static func coverage(_ text: String, size: CGFloat, bold: Bool,
-                         x: Float, y: Float) -> Coverage? {
-        let f = font(size: size, bold: bold)
-        let advance = CGFloat(width(text, size: size, bold: bold))
+        let advance = CGFloat(width(text, font: f))
         guard advance > 0 else { return nil }
 
-        // Generous vertical margin: Menlo's ascent plus a pixel of AA fringe.
-        let pad: CGFloat = 3
         let ascent = CTFontGetAscent(f), descent = CTFontGetDescent(f)
         let w = Int((advance + pad * 2).rounded(.up))
         let h = Int((ascent + descent + pad * 2).rounded(.up))
@@ -100,9 +98,6 @@ enum TextRaster {
         ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
         ctx.setFillColor(gray: 1, alpha: 1)
 
-        // Core Graphics is y-up; the tile is y-down. Draw at a baseline that
-        // leaves `pad` of descent below, then flip when mapping back.
-        let baselineFromBottom = descent + pad
         // Core Text keys rather than AppKit/UIKit ones, so this file stays
         // free of a platform UI framework. The glyph colour comes from the
         // context's fill colour, already set to white above.
@@ -112,20 +107,47 @@ enum TextRaster {
         ]
         let line = CTLineCreateWithAttributedString(
             NSAttributedString(string: text, attributes: attrs))
-        ctx.textPosition = CGPoint(x: pad, y: baselineFromBottom)
+        // Core Graphics is y-up; both callers are y-down. Draw at a baseline
+        // that leaves `pad` of descent below, then flip when mapping back.
+        ctx.textPosition = CGPoint(x: pad, y: descent + pad)
         CTLineDraw(line, ctx)
 
         guard let data = ctx.data else { return nil }
         let raw = data.bindMemory(to: UInt8.self, capacity: w * h)
         // Core Graphics' bitmap rows already run top-down even though its user
         // space is y-up, so these land in tile order as they are.
-        let alpha = [UInt8](UnsafeBufferPointer(start: raw, count: w * h))
+        return Raster(width: w, height: h, advance: advance,
+                      ascent: ascent, descent: descent, pad: pad,
+                      alpha: [UInt8](UnsafeBufferPointer(start: raw, count: w * h)))
+    }
 
-        let baselineY = y + middleBaselineOffset(size: size, bold: bold)
-        return Coverage(width: w, height: h,
-                        originX: x - Float(pad),
-                        originY: baselineY - Float(ascent + pad),
-                        alpha: alpha)
+    /// The rasterised bitmap on its own. It depends on the string, the size and
+    /// the weight — never on where the label sits — so it is worth keeping.
+    /// It carries the metrics `place` needs, so a cache hit costs no font.
+    struct Bitmap {
+        let width: Int
+        let height: Int
+        let ascent: Float
+        let middleOffset: Float
+        let pad: Float
+        let alpha: [UInt8]
+    }
+
+    /// The expensive half of placing a label, which caches.
+    static func bitmap(_ text: String, size: CGFloat, bold: Bool) -> Bitmap? {
+        guard let r = raster(text, size: size, bold: bold, pad: labelPad) else { return nil }
+        return Bitmap(width: r.width, height: r.height,
+                      ascent: Float(r.ascent), middleOffset: r.middleBaselineOffset,
+                      pad: Float(r.pad), alpha: r.alpha)
+    }
+
+    /// …and the cheap half, which just places it.
+    static func place(_ b: Bitmap, x: Float, y: Float) -> Coverage {
+        let baselineY = y + b.middleOffset
+        return Coverage(width: b.width, height: b.height,
+                        originX: x - b.pad,
+                        originY: baselineY - (b.ascent + b.pad),
+                        alpha: b.alpha)
     }
 
     /// (`glyphSites`) — the lattice points a label covers. Each one reserves a
@@ -141,7 +163,7 @@ enum TextRaster {
         if let hit = cache[key] { bm = hit }
         else if let made = bitmap(text, size: size, bold: bold) { bm = made; cache[key] = made }
         else { return [] }
-        let cov = place(bm, text: text, size: size, bold: bold, x: x, y: y)
+        let cov = place(bm, x: x, y: y)
         let step = Float(Draw.glyphLattice)
         var out: [SIMD2<Float>] = []
 

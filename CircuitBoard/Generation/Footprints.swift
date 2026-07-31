@@ -71,47 +71,77 @@ extension TileGenerator {
     /// cells, two parallel runs a stroke width apart that read as one line
     /// ending in a spike. It also routes better — the escape starts pointing
     /// at where it is going instead of behind the pad.
-    func padPorts(_ padIndex: Int, keepout r: Int, toward: SIMD2<Int32>? = nil) -> [SIMD2<Int32>] {
-        let dirs = [SIMD2(1, 0), SIMD2(-1, 0), SIMD2(0, 1), SIMD2(0, -1)]
+    /// The four axis directions, as arithmetic rather than a table: index 0 is
+    /// east, 1 west, 2 south, 3 north.
+    @inline(__always) private static func portDX(_ k: Int) -> Int { k == 0 ? 1 : (k == 1 ? -1 : 0) }
+    @inline(__always) private static func portDY(_ k: Int) -> Int { k == 2 ? 1 : (k == 3 ? -1 : 0) }
+
+    /// Every legal port of `padIndex`, best first, handed to `body` one at a
+    /// time. Returning true from `body` stops the walk.
+    ///
+    /// Allocation-free, which is the entire point. The array-returning version
+    /// this replaced built five heap objects per call — a `dirs` literal, the
+    /// rotated order, the `enumerated().sorted()` pair and the result — and it
+    /// is called 171,000 times over twenty-five tiles, about a quarter of
+    /// generation. Choosing between four directions should not touch the heap.
+    ///
+    /// The order is unchanged: rotate by `start`, then sort by score against
+    /// `toward` with the rotation as the tie-break. That comparator is a total
+    /// order, so selecting the maximum four times running yields exactly the
+    /// permutation `sorted` did — the boards come out bit-identical.
+    func forEachPadPort(_ padIndex: Int, keepout r: Int, toward: SIMD2<Int32>? = nil,
+                        _ body: (SIMD2<Int32>) -> Bool) {
         let start = rng.int(0, 3)
         let p = data.pads[padIndex]
-        // The rotation by `start` is the tie-break, not the choice.
-        var order = (0..<4).map { ($0 + start) % 4 }
+
+        var ux: Float = 0, uy: Float = 0, scored = false
         if let toward {
             let vx = Float(Int(toward.x) - p.gx), vy = Float(Int(toward.y) - p.gy)
             let n = (vx * vx + vy * vy).squareRoot()
-            if n > 0 {
-                let ux = vx / n, uy = vy / n
-                // Ordered on (score, rotation) — a total order, so this does
-                // not depend on the sort being stable.
-                order = order.enumerated().sorted { l, r in
-                    let sl = Float(dirs[l.element].x) * ux + Float(dirs[l.element].y) * uy
-                    let sr = Float(dirs[r.element].x) * ux + Float(dirs[r.element].y) * uy
-                    return sl != sr ? sl > sr : l.offset < r.offset
-                }.map(\.element)
-            }
+            if n > 0 { ux = vx / n; uy = vy / n; scored = true }
         }
-        var out: [SIMD2<Int32>] = []
-        for k in order {
-            let d = dirs[k]
-            let gx = p.gx + d.x * (p.rx + 1 + r)
-            let gy = p.gy + d.y * (p.ry + 1 + r)
+        @inline(__always) func score(_ k: Int) -> Float {
+            Float(TileGenerator.portDX(k)) * ux + Float(TileGenerator.portDY(k)) * uy
+        }
+
+        // Selection over four, ties broken by position in the rotated order —
+        // the same total order the comparator defined.
+        var taken: UInt8 = 0
+        for _ in 0..<4 {
+            var bestOffset = -1
+            var bestScore = -Float.greatestFiniteMagnitude
+            for offset in 0..<4 where taken & (1 << UInt8(offset)) == 0 {
+                let k = (offset + start) % 4
+                let sc = scored ? score(k) : 0
+                if bestOffset < 0 || sc > bestScore {
+                    bestScore = sc
+                    bestOffset = offset
+                }
+                if !scored { break }        // no target: the rotation is the order
+            }
+            guard bestOffset >= 0 else { break }
+            taken |= 1 << UInt8(bestOffset)
+            let k = (bestOffset + start) % 4
+            let gx = p.gx + TileGenerator.portDX(k) * (p.rx + 1 + r)
+            let gy = p.gy + TileGenerator.portDY(k) * (p.ry + 1 + r)
             if !grid.inBounds(gx, gy) { continue }
             if grid.blocked(gx, gy, r) { continue }
-            out.append(SIMD2(Int32(gx), Int32(gy)))
+            if body(SIMD2(Int32(gx), Int32(gy))) { return }
         }
-        return out
     }
 
     /// The best legal port, when the caller cannot try more than one.
     func padPort(_ padIndex: Int, keepout r: Int, toward: SIMD2<Int32>? = nil) -> SIMD2<Int32>? {
-        padPorts(padIndex, keepout: r, toward: toward).first
+        var first: SIMD2<Int32>?
+        forEachPadPort(padIndex, keepout: r, toward: toward) { first = $0; return true }
+        return first
     }
 
     /// Does the un-routed stub from `port` to the pad centre run back against
     /// the way the route arrived? That is the spike: two parallel runs a
     /// stroke apart, reading as one line that ends in a point.
-    func stubDoublesBack(_ path: [SIMD2<Int32>], port: SIMD2<Int32>, pad: Int) -> Bool {
+    func stubDoublesBack(_ path: [SIMD2<Int32>], port: SIMD2<Int32>, pad: Int,
+                         fromStart: Bool = false) -> Bool {
         guard path.count >= 2 else { return false }
         let p = data.pads[pad]
         let stub = SIMD2<Float>(Float(p.gx) - Float(port.x), Float(p.gy) - Float(port.y))
@@ -120,14 +150,27 @@ extension TileGenerator {
         let sx = stub.x / sl, sy = stub.y / sl
         // Look back along the route as far as the eye reads the two runs as one
         // line — about five cells — not just at the final step.
+        //
+        // `fromStart` walks the other way for the pad a route *leaves*. The
+        // callers used to hand over `Array(path.reversed())` for that, copying
+        // a whole path — thirty cells on average, sometimes hundreds — to
+        // inspect the eight at one end of it.
         var arc: Float = 0
-        var i = path.count - 1
-        while i > 0, arc < Float(Routing.stubWindow) {
-            let v = SIMD2<Float>(Float(path[i].x - path[i-1].x), Float(path[i].y - path[i-1].y))
+        var i = fromStart ? 0 : path.count - 1
+        while arc < Float(Routing.stubWindow) {
+            let a: SIMD2<Int32>, b: SIMD2<Int32>
+            if fromStart {
+                guard i < path.count - 1 else { break }
+                a = path[i]; b = path[i + 1]          // stepping away from the pad
+            } else {
+                guard i > 0 else { break }
+                a = path[i]; b = path[i - 1]
+            }
+            let v = SIMD2<Float>(Float(a.x - b.x), Float(a.y - b.y))
             let l = (v.x * v.x + v.y * v.y).squareRoot()
             arc += l
             if l > 0, (v.x / l) * sx + (v.y / l) * sy < -0.7071 { return true }
-            i -= 1
+            i += fromStart ? 1 : -1
         }
         return false
     }
@@ -137,10 +180,13 @@ extension TileGenerator {
     /// route as before; only the rest pay for a second look.
     func routeToPad(from start: SIMD2<Int32>, pad: Int, keepout r: Int,
                     via: (SIMD2<Int32>) -> [SIMD2<Int32>]?) -> (path: [SIMD2<Int32>], port: SIMD2<Int32>)? {
-        for q in padPorts(pad, keepout: r, toward: start) {
-            guard let path = via(q) else { continue }
-            if !stubDoublesBack(path, port: q, pad: pad) { return (path, q) }
+        var hit: (path: [SIMD2<Int32>], port: SIMD2<Int32>)?
+        forEachPadPort(pad, keepout: r, toward: start) { q in
+            guard let path = via(q) else { return false }
+            if !stubDoublesBack(path, port: q, pad: pad) { hit = (path, q); return true }
+            return false
         }
+        if let hit { return hit }
         // Every port would leave a stub doubling back over the route. Refuse the
         // pad rather than draw the wedge — the caller has nine more to try, and
         // a trace that does not exist is better than one that looks broken.

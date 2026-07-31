@@ -200,8 +200,7 @@ final class TileGenerator {
                 // padTrace can pick it again and both traces converge on the
                 // same pad centre.
                 if let own = pool.firstIndex(of: p) { pool.remove(at: own) }
-                let aPorts = padPorts(p, keepout: r)
-                guard let a = aPorts.first else { continue }
+                guard let a = padPort(p, keepout: r) else { continue }
 
                 var b: SIMD2<Int32>?
                 var combPath: [SIMD2<Int32>]?
@@ -237,7 +236,7 @@ final class TileGenerator {
                 else { continue }
                 // The escape's own stub is drawn too. If it doubles back over
                 // the route, drop this pin rather than draw the wedge.
-                if stubDoublesBack(Array(path.reversed()), port: a, pad: p) { continue }
+                if stubDoublesBack(path, port: a, pad: p, fromStart: true) { continue }
                 grid.claim(path, width: w)
                 data.pads[p].taken = true
                 if let target { data.pads[target].taken = true }
@@ -298,17 +297,18 @@ final class TileGenerator {
             // Both ends get the same treatment: a port is only right if the
             // stub it leaves behind carries on the way the route runs.
             var best: [SIMD2<Int32>]?
-            for pa in padPorts(ai, keepout: r, toward: SIMD2(Int32(b.gx), Int32(b.gy))) {
+            forEachPadPort(ai, keepout: r, toward: SIMD2(Int32(b.gx), Int32(b.gy))) { pa in
                 guard let hit = routeToPad(from: pa, pad: bi, keepout: r, via: {
                     router.route(from: pa, to: $0, keepout: r)
-                }) else { continue }
+                }) else { return false }
                 // Both stubs are drawn, so both have to carry on the way the
                 // route runs. No port that does, no trace: there are nine more
                 // pairs to try.
-                if !stubDoublesBack(Array(hit.path.reversed()), port: pa, pad: ai) {
+                if !stubDoublesBack(hit.path, port: pa, pad: ai, fromStart: true) {
                     best = hit.path
-                    break
+                    return true
                 }
+                return false
             }
             guard let path = best else { continue }
             grid.claim(path, width: w)

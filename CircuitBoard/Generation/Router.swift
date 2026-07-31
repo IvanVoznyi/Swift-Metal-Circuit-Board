@@ -665,7 +665,23 @@ final class Router {
             let history = recentDirs[cur]
             let forbidden = forbiddenDirectionsMask(history)
 
-            for di in 0..<8 {
+            // Iterate the directions the spike rule allows, rather than
+            // entering all eight and rejecting three of them inside.
+            //
+            // The rejection is the same either way; what changes is that a
+            // forbidden direction now costs nothing at all — no loop overhead,
+            // no dx/dy, no bounds test, no index arithmetic. Roughly three of
+            // eight are forbidden at any pop, so the body runs about five times
+            // instead of eight. Measured over five interleaved runs: 12.55 ms a
+            // tile to 11.93, boards bit-identical.
+            //
+            // Worth distinguishing from simply testing the mask earlier in the
+            // chain, which was tried and measured at nothing: the saving is in
+            // never entering the iteration, not in rejecting it sooner.
+            var candidates = UInt32(0xFF) & ~forbidden
+            while candidates != 0 {
+                let di = candidates.trailingZeroBitCount
+                candidates &= candidates &- 1
                 let dx = Router.dx(di), dy = Router.dy(di)
                 let nx = cx + dx, ny = cy + dy
                 if nx < 0 || ny < 0 || nx >= cols || ny >= rows { continue }
@@ -683,18 +699,10 @@ final class Router {
                     if grid.blocked(cx + dx, cy, r) || grid.blocked(cx, cy + dy, r) { continue }
                 }
                 // No spike: never leave more than 90 degrees off the way the
-                // line arrived, and never off the way it was going two or three
-                // cells back either. A single 135 degree vertex and a pair of
-                // 90s over five cells draw the same thing — a wedge with the
-                // line doubling back beside itself — and the turn cost alone
-                // only prices those, it does not forbid them. A wide U-turn is
-                // untouched: this looks back three cells, not thirty.
-                // No spike: never leave more than 90 degrees off the way the
                 // line arrived, nor off the way it was going a few cells back.
                 // A single 135 degree vertex and a pair of 90s over five cells
                 // draw the same thing — a wedge with the line doubling back
                 // beside itself — and the turn cost alone only prices those.
-                if forbidden & (1 << UInt32(di)) != 0 { continue }
                 var turn: Float = 0
                 if cd >= 0 {
                     let dd = Router.turnSteps(di, cd)

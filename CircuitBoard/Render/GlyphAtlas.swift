@@ -105,43 +105,18 @@ enum GlyphAtlas {
         return entries
     }
 
+    /// The pixels come from `TextRaster`, which both this and the label lattice
+    /// share; only the origin convention below is ours. The atlas wants a
+    /// tighter margin than a label does, hence `padding` rather than its 3.
     private static func rasterize(_ text: String, pointSize: Int, scale: Float) -> Bitmap? {
-        let pixelSize = max(1, Int((Float(pointSize) * scale).rounded()))
-        let font = TextRaster.font(size: CGFloat(pixelSize), bold: false)
-        let advance = CGFloat(TextRaster.width(text, size: CGFloat(pixelSize)))
-        guard advance > 0 else { return nil }
-        let ascent = CTFontGetAscent(font), descent = CTFontGetDescent(font)
-        let pad = CGFloat(padding)
-        let w = Int((advance + pad * 2).rounded(.up))
-        let h = Int((ascent + descent + pad * 2).rounded(.up))
-        guard w > 0, h > 0,
-              let ctx = CGContext(data: nil, width: w, height: h,
-                                  bitsPerComponent: 8, bytesPerRow: w,
-                                  space: CGColorSpaceCreateDeviceGray(),
-                                  bitmapInfo: CGImageAlphaInfo.none.rawValue)
+        let pixelSize = CGFloat(max(1, Int((Float(pointSize) * scale).rounded())))
+        guard let r = TextRaster.raster(text, size: pixelSize, bold: false,
+                                        pad: CGFloat(padding))
         else { return nil }
-
-        ctx.setFillColor(gray: 0, alpha: 1)
-        ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
-        ctx.setFillColor(gray: 1, alpha: 1)
-        let attrs: [NSAttributedString.Key: Any] = [
-            NSAttributedString.Key(kCTFontAttributeName as String): font,
-            NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true,
-        ]
-        let line = CTLineCreateWithAttributedString(
-            NSAttributedString(string: text, attributes: attrs))
-        ctx.textPosition = CGPoint(x: pad, y: descent + pad)
-        CTLineDraw(line, ctx)
-        guard let data = ctx.data else { return nil }
-
-        // Core Graphics' user space is y-up, but its bitmap rows already run
-        // top-down — row 0 is the top of the drawn image — matching the tile.
-        let raw = data.bindMemory(to: UInt8.self, capacity: w * h)
-        let middleOffset = CGFloat(TextRaster.middleBaselineOffset(
-            size: CGFloat(pixelSize), bold: false))
-        return Bitmap(pixels: [UInt8](UnsafeBufferPointer(start: raw, count: w * h)),
-                      width: w, height: h,
-                      minX: Float(-advance / 2 - pad),
-                      minY: Float(middleOffset - ascent - pad))
+        // Origin at the string's horizontal centre on its `middle` baseline.
+        let middleOffset = CGFloat(r.middleBaselineOffset)
+        return Bitmap(pixels: r.alpha, width: r.width, height: r.height,
+                      minX: Float(-r.advance / 2 - r.pad),
+                      minY: Float(middleOffset - r.ascent - r.pad))
     }
 }

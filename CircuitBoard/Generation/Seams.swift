@@ -114,7 +114,8 @@ extension TileGenerator {
         let heading = port.row == 0 ? 2 : 6          // (0, +1) / (0, -1)
         if ok, let last = lead.last,
            let p = router.route(from: last, to: target, keepout: r, heading: heading),
-           !returnsToSeam(p, row: port.row) {
+           !returnsToSeam(p, row: port.row),
+           !crosses(p, lead) {
             return lead.dropLast() + p
         }
         // Unconstrained fallback, but never one that turns straight back at the
@@ -130,6 +131,32 @@ extension TileGenerator {
     private func returnsToSeam(_ path: [SIMD2<Int32>], row: Int) -> Bool {
         for c in path.dropFirst().prefix(Routing.stubWindow) where Int(c.y) == row {
             return true
+        }
+        return false
+    }
+
+    /// Does the route run back over the lead the trace is about to draw?
+    ///
+    /// The lead is real copper, but it is never claimed: it is checked free,
+    /// then the router is started from its far end, so the grid the router
+    /// consults has nothing in those cells. A route that comes back through
+    /// them draws one line lying across itself — a loop with a tail, which is
+    /// what it looks like on screen.
+    ///
+    /// `returnsToSeam` does not cover this. It watches the seam *row* for the
+    /// first `stubWindow` cells, to catch a stub doubling back at the boundary;
+    /// a route that loops away and returns twenty cells later is a different
+    /// shape and passes it. Rejecting here costs nothing, because the fallback
+    /// below starts at the port itself and so cannot repeat a cell at all.
+    ///
+    /// Only the cells that get prepended count. The route legitimately begins
+    /// on `lead.last`, which is why that one is dropped.
+    private func crosses(_ path: [SIMD2<Int32>], _ lead: [SIMD2<Int32>]) -> Bool {
+        // A step is one cell, and the lead is a straight column, so a route
+        // cannot pass through it without standing on it — comparing cells is
+        // enough, with no need to test segments for geometric intersection.
+        for c in path {
+            for l in lead.dropLast() where l == c { return true }
         }
         return false
     }

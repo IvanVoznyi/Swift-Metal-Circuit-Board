@@ -33,16 +33,41 @@ final class RoutingGrid {
     /// Visited marks for the local hug repair. Separate from the field itself
     /// because the repair has to propagate *through* cells whose value is
     /// already correct, which it could not do if the value were the mark.
-    private let repairStamp: UnsafeMutableBufferPointer<UInt32>
-    private var repairGeneration: UInt32 = 0
+    ///
+    /// Sixteen bits, not thirty-two. The width buys nothing but a longer gap
+    /// between wraps, and a wrap is already handled exactly — clear the marks,
+    /// restart at 1 — so it only decides how often that clear runs. At the
+    /// measured eighteen repairs a tile it is one 33 KB memset every ~3,600
+    /// tiles, against 33 KB of resident memory saved on every worker for the
+    /// whole run. `initialize` touches every page, so this buffer is resident
+    /// in full whether the marks are used or not.
+    private let repairStamp: UnsafeMutableBufferPointer<UInt16>
+    private var repairGeneration: UInt16 = 0
 
     /// Cells that became occupied since the last hug settle. `hug` is a pure
     /// function of `occ`, and Chebyshev dilation is local, so re-deriving only
     /// the neighbourhood of these cells is identical to rebuilding the whole
     /// field — which the HTML did after every single `claim`.
-    private var pendingSources: [Int32] = []
-    private var frontier: [Int32] = []
-    private var nextFrontier: [Int32] = []
+    ///
+    /// These three are raw buffers rather than `[Int32]`. They are written from
+    /// the innermost loop of every field update, where a Swift array costs an
+    /// exclusivity check on the class property, a uniqueness check on the
+    /// buffer and a capacity check per append. A dilation can enqueue a cell at
+    /// most once per level, so `count` is a hard bound and no growth is ever
+    /// possible — the checks were guarding against something that cannot happen.
+    private var pendingSources: UnsafeMutablePointer<Int32>
+    private var pendingCount = 0
+    private var frontier: UnsafeMutablePointer<Int32>
+    private var nextFrontier: UnsafeMutablePointer<Int32>
+    private var frontCount = 0
+
+    /// Frontier entries are packed `x | y << 16`, not linear indices. Unpacking
+    /// an index costs `i % cols` and `i / cols` — a real integer division,
+    /// twenty thousand times a tile, because `cols` is not known at compile
+    /// time. Every producer already holds x and y when it enqueues.
+    @inline(__always) private static func pack(_ x: Int, _ y: Int) -> Int32 {
+        Int32(x | (y << 16))
+    }
 
     init(cols: Int, rows: Int) {
         self.cols = cols
@@ -52,18 +77,21 @@ final class RoutingGrid {
         occWords = .allocate(capacity: wordCount)
         hugStore = .allocate(capacity: count)
         repairStamp = .allocate(capacity: count)
+        pendingSources = .allocate(capacity: count)
+        frontier = .allocate(capacity: count)
+        nextFrontier = .allocate(capacity: count)
         occWords.initialize(repeating: 0, count: wordCount)
         hugStore.initialize(repeating: 0)
         repairStamp.initialize(repeating: 0)
-        pendingSources.reserveCapacity(1024)
-        frontier.reserveCapacity(4096)
-        nextFrontier.reserveCapacity(4096)
     }
 
     deinit {
         occWords.deallocate()
         hugStore.deallocate()
         repairStamp.deallocate()
+        pendingSources.deallocate()
+        frontier.deallocate()
+        nextFrontier.deallocate()
     }
 
     var hug: UnsafeMutableBufferPointer<UInt8> { hugStore }
@@ -87,7 +115,7 @@ final class RoutingGrid {
         version &+= 1
         occWords.update(repeating: 0, count: wordCount)
         hugStore.update(repeating: 0)
-        pendingSources.removeAll(keepingCapacity: true)
+        pendingCount = 0
     }
 
     // MARK: - Occupancy
@@ -113,7 +141,8 @@ final class RoutingGrid {
                 let i = row + x
                 if !isSet(i) {
                     set(i)
-                    pendingSources.append(Int32(i))
+                    pendingSources[pendingCount] = RoutingGrid.pack(x, y)
+                    pendingCount += 1
                 }
                 hugStore[i] = 0
             }
@@ -173,7 +202,7 @@ final class RoutingGrid {
         // The repair assumes the field is exact for the copper still standing.
         // Anything marked and not yet settled would be lost outside the box,
         // where nothing recomputes it.
-        if !pendingSources.isEmpty { settleHug() }
+        if pendingCount > 0 { settleHug() }
         version &+= 1
 
         var x0 = cols, y0 = rows, x1 = -1, y1 = -1
@@ -199,51 +228,26 @@ final class RoutingGrid {
         if repairGeneration == 0 { repairStamp.update(repeating: 0); repairGeneration = 1 }
         let gen = repairGeneration
 
-        frontier.removeAll(keepingCapacity: true)
+        var m = 0
         for y in sy0...sy1 {
             let row = y * cols
             for x in sx0...sx1 where isSet(row + x) {
                 repairStamp[row + x] = gen
-                frontier.append(Int32(row + x))
+                frontier[m] = RoutingGrid.pack(x, y)
+                m += 1
             }
         }
-        guard !frontier.isEmpty else { return }
+        frontCount = m
+        guard m > 0 else { return }
 
-        for level in 1...radius {
-            nextFrontier.removeAll(keepingCapacity: true)
-            let l = UInt8(level)
-            for i in frontier {
-                let x = Int(i) % cols, y = Int(i) / cols
-                for dy in -1...1 {
-                    let ny = y + dy
-                    if ny < 0 || ny >= rows { continue }
-                    let row = ny * cols
-                    for dx in -1...1 {
-                        let nx = x + dx
-                        if nx < 0 || nx >= cols { continue }
-                        let j = row + nx
-                        // Copper is a source, never a step: a cell whose line to
-                        // the nearest copper crosses other copper is nearer to
-                        // that one instead, so stopping here changes no answer.
-                        if isSet(j) { continue }
-                        if repairStamp[j] == gen { continue }
-                        repairStamp[j] = gen
-                        if nx >= dx0, nx <= dx1, ny >= dy0, ny <= dy1 { hugStore[j] = l }
-                        nextFrontier.append(Int32(j))
-                    }
-                }
-            }
-            swap(&frontier, &nextFrontier)
-            if frontier.isEmpty { break }
+        dilate { j, x, y, l in
+            if repairStamp[j] == gen { return false }
+            repairStamp[j] = gen
+            // Outside the dilation box the stored value is already exact, so
+            // the ripple passes through without rewriting it.
+            if x >= dx0, x <= dx1, y >= dy0, y <= dy1 { hugStore[j] = l }
+            return true
         }
-        frontier.removeAll(keepingCapacity: true)
-    }
-
-    /// Release a reserved cell. Distances can grow again, so callers must
-    /// follow with `rebuildHug()` rather than the incremental settle.
-    func release(_ i: Int) {
-        version &+= 1
-        unset(i)
     }
 
     /// `blocked` for a caller that already holds the linear index. The
@@ -290,41 +294,73 @@ final class RoutingGrid {
 
     // MARK: - Hug field
 
+    /// The one Chebyshev dilation in the file. All three field updates — the
+    /// incremental settle, the full rebuild and the local repair — are the same
+    /// breadth-first ripple outward from copper and differ only in the test for
+    /// "is this neighbour new", so that test is the parameter.
+    ///
+    /// `frontier` holds the cells at level `l-1`, packed. `admit(j, x, y, l)`
+    /// decides a neighbour, records whatever it wants to record, and returns
+    /// whether the ripple continues through it — taking the coordinates as well
+    /// as the index so that no caller has to divide them back out. Copper is
+    /// never a step: a cell whose
+    /// line to the nearest copper crosses other copper is nearer to *that* one
+    /// instead, so stopping there changes no answer, and the check is common to
+    /// all three callers.
+    ///
+    /// The neighbour range is clamped once per cell rather than tested once per
+    /// neighbour. Six branches become four selects, and every interior cell —
+    /// which is nearly all of them — walks a full 3×3 with no bounds logic at
+    /// all.
+    @inline(__always)
+    private func dilate(_ admit: (Int, Int, Int, UInt8) -> Bool) {
+        for level in 1...Routing.hugRadius {
+            let src = frontier, dst = nextFrontier
+            let n = frontCount
+            var m = 0
+            let l = UInt8(level)
+            for k in 0..<n {
+                let e = src[k]
+                let x = Int(e & 0xFFFF), y = Int(e >> 16)
+                let y0 = y > 0 ? y - 1 : y, y1 = y < rows - 1 ? y + 1 : y
+                let x0 = x > 0 ? x - 1 : x, x1 = x < cols - 1 ? x + 1 : x
+                for ny in y0...y1 {
+                    let row = ny * cols
+                    for nx in x0...x1 {
+                        let j = row + nx
+                        if isSet(j) { continue }
+                        // The centre cell needs no special case: at level 1 it
+                        // is copper and `isSet` drops it, and deeper it already
+                        // carries a value `admit` rejects.
+                        if !admit(j, nx, ny, l) { continue }
+                        dst[m] = RoutingGrid.pack(nx, ny)
+                        m += 1
+                    }
+                }
+            }
+            frontier = dst
+            nextFrontier = src
+            frontCount = m
+            if m == 0 { break }
+        }
+        frontCount = 0
+    }
+
     /// Incremental, decrease-only dilation from the cells that just became
     /// copper. Chebyshev distance to a union of sets is the min of the
     /// distances, and every previously stored value was already exact, so this
     /// lands on precisely the field a full rebuild would produce.
     func settleHug() {
         version &+= 1
-        guard !pendingSources.isEmpty else { return }
-        frontier.removeAll(keepingCapacity: true)
-        frontier.append(contentsOf: pendingSources)
-        pendingSources.removeAll(keepingCapacity: true)
-
-        for level in 1...Routing.hugRadius {
-            nextFrontier.removeAll(keepingCapacity: true)
-            let l = UInt8(level)
-            for i in frontier {
-                let x = Int(i) % cols, y = Int(i) / cols
-                for dy in -1...1 {
-                    let ny = y + dy
-                    if ny < 0 || ny >= rows { continue }
-                    let row = ny * cols
-                    for dx in -1...1 {
-                        let nx = x + dx
-                        if nx < 0 || nx >= cols { continue }
-                        let j = row + nx
-                        if isSet(j) { continue }
-                        if hugStore[j] != 0 && hugStore[j] <= l { continue }
-                        hugStore[j] = l
-                        nextFrontier.append(Int32(j))
-                    }
-                }
-            }
-            swap(&frontier, &nextFrontier)
-            if frontier.isEmpty { break }
+        guard pendingCount > 0 else { return }
+        frontier.update(from: pendingSources, count: pendingCount)
+        frontCount = pendingCount
+        pendingCount = 0
+        dilate { j, _, _, l in
+            if hugStore[j] != 0 && hugStore[j] <= l { return false }
+            hugStore[j] = l
+            return true
         }
-        frontier.removeAll(keepingCapacity: true)
     }
 
     /// Full multi-source rebuild. Only needed after cells are *released*
@@ -332,32 +368,31 @@ final class RoutingGrid {
     func rebuildHug() {
         version &+= 1
         hugStore.update(repeating: 0)
-        pendingSources.removeAll(keepingCapacity: true)
-        frontier.removeAll(keepingCapacity: true)
-        for i in 0..<count where isSet(i) { frontier.append(Int32(i)) }
-        for level in 1...Routing.hugRadius {
-            nextFrontier.removeAll(keepingCapacity: true)
-            let l = UInt8(level)
-            for i in frontier {
-                let x = Int(i) % cols, y = Int(i) / cols
-                for dy in -1...1 {
-                    let ny = y + dy
-                    if ny < 0 || ny >= rows { continue }
-                    let row = ny * cols
-                    for dx in -1...1 {
-                        let nx = x + dx
-                        if nx < 0 || nx >= cols { continue }
-                        let j = row + nx
-                        if isSet(j) || hugStore[j] != 0 { continue }
-                        hugStore[j] = l
-                        nextFrontier.append(Int32(j))
-                    }
-                }
+        pendingCount = 0
+
+        // Seed from every occupied cell. Walking the bitset word by word and
+        // stepping the set bits out of it touches one word per sixty-four cells
+        // instead of testing all sixteen thousand one at a time; the row stays
+        // in step with the scan, so no cell costs a division.
+        var m = 0, y = 0, rowEnd = cols
+        for w in 0..<wordCount {
+            var bits = occWords[w]
+            while bits != 0 {
+                let i = (w << 6) | bits.trailingZeroBitCount
+                bits &= bits &- 1
+                while i >= rowEnd { y += 1; rowEnd += cols }
+                frontier[m] = RoutingGrid.pack(i - rowEnd + cols, y)
+                m += 1
             }
-            swap(&frontier, &nextFrontier)
-            if frontier.isEmpty { break }
         }
-        frontier.removeAll(keepingCapacity: true)
+        frontCount = m
+        guard m > 0 else { return }
+
+        dilate { j, _, _, l in
+            if hugStore[j] != 0 { return false }
+            hugStore[j] = l
+            return true
+        }
     }
 
     // MARK: - Free space
