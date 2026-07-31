@@ -100,23 +100,34 @@ extension TileGenerator {
                        keepout r: Int) -> [SIMD2<Int32>]? {
         let a = SIMD2(Int32(port.gx), Int32(port.row))
         let step: Int32 = port.row == 0 ? 1 : -1
-        var lead: [SIMD2<Int32>] = [a]
+        // The lead is a straight column, so it is fully described by its start,
+        // its direction and its length — it never needed to be an array. As one
+        // it cost a literal, its growth and the concatenation at the end, on
+        // every pool probe of every port, which made this the heaviest
+        // allocation site in generation.
         var ok = true
         for i in 1...Seam.straightLead {
-            let c = SIMD2(a.x, a.y + step * Int32(i))
-            guard grid.inBounds(Int(c.x), Int(c.y)), !grid.blocked(Int(c.x), Int(c.y), r) else {
+            let y = a.y + step * Int32(i)
+            guard grid.inBounds(Int(a.x), Int(y)), !grid.blocked(Int(a.x), Int(y), r) else {
                 ok = false; break
             }
-            lead.append(c)
         }
         // Straight in, so the router knows the line is already travelling that
         // way and will not turn back on it.
         let heading = port.row == 0 ? 2 : 6          // (0, +1) / (0, -1)
-        if ok, let last = lead.last,
-           let p = router.route(from: last, to: target, keepout: r, heading: heading),
-           !returnsToSeam(p, row: port.row),
-           !crosses(p, lead) {
-            return lead.dropLast() + p
+        if ok {
+            // The loop ran to completion, so the lead is exactly
+            // `straightLead + 1` cells and the route starts on the last of them.
+            let last = SIMD2(a.x, a.y + step * Int32(Seam.straightLead))
+            if let p = router.route(from: last, to: target, keepout: r, heading: heading),
+               !returnsToSeam(p, row: port.row),
+               !crossesLead(p, x: a.x, from: a.y, step: step, count: Seam.straightLead) {
+                var out = [SIMD2<Int32>]()
+                out.reserveCapacity(Seam.straightLead + p.count)
+                for i in 0..<Seam.straightLead { out.append(SIMD2(a.x, a.y + step * Int32(i))) }
+                out.append(contentsOf: p)
+                return out
+            }
         }
         // Unconstrained fallback, but never one that turns straight back at the
         // boundary: the stub from the edge to the first cell is drawn too, and a
@@ -149,15 +160,19 @@ extension TileGenerator {
     /// shape and passes it. Rejecting here costs nothing, because the fallback
     /// below starts at the port itself and so cannot repeat a cell at all.
     ///
-    /// Only the cells that get prepended count. The route legitimately begins
-    /// on `lead.last`, which is why that one is dropped.
-    private func crosses(_ path: [SIMD2<Int32>], _ lead: [SIMD2<Int32>]) -> Bool {
+    /// Only the cells that get prepended count — the `count` cells starting at
+    /// `(x, from)` and stepping by `step`. The route legitimately begins on the
+    /// one after them, which is why it is not included.
+    private func crossesLead(_ path: [SIMD2<Int32>], x: Int32, from: Int32,
+                             step: Int32, count: Int) -> Bool {
         // A step is one cell, and the lead is a straight column, so a route
         // cannot pass through it without standing on it — comparing cells is
         // enough, with no need to test segments for geometric intersection.
-        for c in path {
-            for l in lead.dropLast() where l == c { return true }
-        }
+        // Being a column also makes it a range test rather than a search.
+        guard count > 0 else { return false }
+        let end = from + step * Int32(count - 1)
+        let lo = min(from, end), hi = max(from, end)
+        for c in path where c.x == x && c.y >= lo && c.y <= hi { return true }
         return false
     }
 

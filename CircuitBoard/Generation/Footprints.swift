@@ -202,14 +202,17 @@ extension TileGenerator {
 
     // MARK: - Loose pads
 
+    /// The draw bag for loose pads, weighted by repetition. A literal here was
+    /// a fresh heap array on every call; the contents never change.
+    private static let loosePadTypes: [PadType] = [.via, .throughHole, .throughHole, .smd, .smd]
+
     func makePads(_ n: Int) {
-        let types: [PadType] = [.via, .throughHole, .throughHole, .smd, .smd]
         var placed = 0, tries = 0
         while placed < n && tries < n * 10 {
             tries += 1
             let gx = rng.int(2, grid.cols - 3)
             let gy = rng.int(2, Board.rows - 3)
-            let type = rng.pick(types)
+            let type = rng.pick(TileGenerator.loosePadTypes)
             var p = Pad(gx: gx, gy: gy, type: type, metal: rng.pick(palette.metals))
             switch type {
             case .via:
@@ -409,25 +412,28 @@ extension TileGenerator {
                 p.ry = RoutingGrid.padKeepout((vertical ? ph : pw) / 2)
                 return p
             }
-            // Built side by side, then appended top→bottom→left→right, because
-            // pool order decides which pads later traces reach for.
-            var built: [[Pad]] = [[], [], [], []]
-            for i in 0..<n {
-                let d = -off + i * pitch
-                built[0].append(pin(cx + d, cy - hb - 1, vertical: true))
-                built[1].append(pin(cx + d, cy + hb + 1, vertical: true))
-                built[2].append(pin(cx - hb - 1, cy + d, vertical: false))
-                built[3].append(pin(cx + hb + 1, cy + d, vertical: false))
-            }
+            // Appended top→bottom→left→right, because pool order decides which
+            // pads later traces reach for. `pin` draws no randomness, so each
+            // pad can be built where it is appended and the sequence is the
+            // same one the four intermediate rows used to produce.
             var sides: [[Int]] = [[], [], [], []]
             for s in 0..<4 {
-                for p in built[s] {
+                sides[s].reserveCapacity(n)
+                for i in 0..<n {
+                    let d = -off + i * pitch
+                    let p: Pad
+                    switch s {
+                    case 0:  p = pin(cx + d, cy - hb - 1, vertical: true)
+                    case 1:  p = pin(cx + d, cy + hb + 1, vertical: true)
+                    case 2:  p = pin(cx - hb - 1, cy + d, vertical: false)
+                    default: p = pin(cx + hb + 1, cy + d, vertical: false)
+                    }
                     data.pads.append(p)
                     sides[s].append(data.pads.count - 1)
                 }
             }
             grid.markBox(cx - hb, cy - hb, cx + hb, cy + hb)  // nothing routes under the die
-            markPads(sides.flatMap { $0 })
+            for side in sides { markPads(side) }
             combs.append(contentsOf: sides)
             return ChipBody(x0: cx - hb, y0: cy - hb, x1: cx + hb, y1: cy + hb,
                             metal: metal,
@@ -475,23 +481,26 @@ extension TileGenerator {
                 p.ry = RoutingGrid.padKeepout((vertical ? ph : pw) / 2)
                 return p
             }
-            var builtA: [Pad] = [], builtB: [Pad] = []
+            // One side fully, then the other — pool order is load-bearing. As in
+            // `clusterChip`, `pin` draws no randomness, so building each pad at
+            // the point it is appended gives the identical sequence with no
+            // intermediate rows.
+            var sideA: [Int] = [], sideB: [Int] = []
+            sideA.reserveCapacity(n); sideB.reserveCapacity(n)
             for i in 0..<n {
                 let d = -off + i * pitch
-                if !vert {
-                    builtA.append(pin(cx + d, cy - hbY - 1, vertical: true))
-                    builtB.append(pin(cx + d, cy + hbY + 1, vertical: true))
-                } else {
-                    builtA.append(pin(cx - hbX - 1, cy + d, vertical: false))
-                    builtB.append(pin(cx + hbX + 1, cy + d, vertical: false))
-                }
+                let p = vert ? pin(cx - hbX - 1, cy + d, vertical: false)
+                             : pin(cx + d, cy - hbY - 1, vertical: true)
+                data.pads.append(p); sideA.append(data.pads.count - 1)
             }
-            // One side fully, then the other — pool order is load-bearing.
-            var sideA: [Int] = [], sideB: [Int] = []
-            for p in builtA { data.pads.append(p); sideA.append(data.pads.count - 1) }
-            for p in builtB { data.pads.append(p); sideB.append(data.pads.count - 1) }
+            for i in 0..<n {
+                let d = -off + i * pitch
+                let p = vert ? pin(cx + hbX + 1, cy + d, vertical: false)
+                             : pin(cx + d, cy + hbY + 1, vertical: true)
+                data.pads.append(p); sideB.append(data.pads.count - 1)
+            }
             grid.markBox(cx - hbX, cy - hbY, cx + hbX, cy + hbY)
-            markPads(sideA + sideB)
+            markPads(sideA); markPads(sideB)
             combs.append(sideA)
             combs.append(sideB)
             return ChipBody(x0: cx - hbX, y0: cy - hbY, x1: cx + hbX, y1: cy + hbY,
@@ -525,13 +534,16 @@ extension TileGenerator {
     /// chip. Purely cosmetic — nothing routes to them — but they reserve grid
     /// keepout exactly like a pad, placed before routing so the router flows
     /// around them.
+    /// Likewise the decor draw bag — `.block` twice because it is the one that
+    /// should recur.
+    private static let decorKinds: [DecorItem.Kind] = [.soic, .block, .block, .dots, .frame,
+                                                       .bars, .tinySquare, .diagonal, .dip]
+
     func makeDecor(_ n: Int) {
-        let kinds: [DecorItem.Kind] = [.soic, .block, .block, .dots, .frame,
-                                       .bars, .tinySquare, .diagonal, .dip]
         var placed = 0, tries = 0
         while placed < n && tries < n * 10 {
             tries += 1
-            let kind = rng.pick(kinds)
+            let kind = rng.pick(TileGenerator.decorKinds)
             let metal = rng.pick(palette.metals)
             // Per-component size boost of up to +15%. Reserved at the scaled
             // size and applied at draw time, so a bigger part still keeps its

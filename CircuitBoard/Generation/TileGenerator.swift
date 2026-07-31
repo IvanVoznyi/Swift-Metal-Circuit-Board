@@ -377,6 +377,24 @@ final class TileGenerator {
     /// every trace corridor, pad keepout and label keepout — and then marked.
     /// So a number can never cross copper, and never another number either.
     /// Unplaceable candidates are simply dropped.
+    /// Decimal digits of `v`, zero-padded to `digits`, built straight into the
+    /// string's own storage.
+    ///
+    /// `String(format:)` goes through CoreFoundation's formatter, which showed
+    /// up in the profile under its own name. Every candidate number is composed
+    /// before it can be measured and tested for space, and most candidates are
+    /// then rejected, so this runs about two hundred times a tile to keep a
+    /// dozen.
+    @inline(__always)
+    private static func digits(_ v: Int, _ digits: Int) -> String {
+        String(unsafeUninitializedCapacity: digits) { buf in
+            var rest = v
+            var i = digits - 1
+            while i >= 0 { buf[i] = UInt8(48 + rest % 10); rest /= 10; i -= 1 }
+            return digits
+        }
+    }
+
     func makeNumbers(_ n: Int) -> [NumberLabel] {
         var out: [NumberLabel] = []
         var tries = 0
@@ -386,16 +404,39 @@ final class TileGenerator {
             let text: String
             switch kind {
             case 0:
-                text = String(format: "%03d", rng.int(0, 999))
+                text = TileGenerator.digits(rng.int(0, 999), 3)
             case 1:
-                text = "0x" + String(rng.int(0, 255), radix: 16, uppercase: true)
+                // "0x" then one or two uppercase hex digits, unpadded — what
+                // `String(_:radix:uppercase:)` produced.
+                let v = rng.int(0, 255)
+                text = String(unsafeUninitializedCapacity: 4) { buf in
+                    func hex(_ d: Int) -> UInt8 { d < 10 ? UInt8(48 + d) : UInt8(55 + d) }
+                    buf[0] = UInt8(ascii: "0"); buf[1] = UInt8(ascii: "x")
+                    if v < 16 { buf[2] = hex(v); return 3 }
+                    buf[2] = hex(v >> 4); buf[3] = hex(v & 15)
+                    return 4
+                }
             case 2:
                 let whole = rng.int(0, 99)
                 let frac = rng.int(0, 99)
-                text = "\(whole)." + String(format: "%02d", frac)
+                // The whole part is unpadded, the fraction is two digits.
+                let wide = whole > 9
+                text = String(unsafeUninitializedCapacity: wide ? 5 : 4) { buf in
+                    var i = 0
+                    if wide { buf[0] = UInt8(48 + whole / 10); i = 1 }
+                    buf[i] = UInt8(48 + whole % 10); i += 1
+                    buf[i] = UInt8(ascii: "."); i += 1
+                    buf[i] = UInt8(48 + frac / 10); i += 1
+                    buf[i] = UInt8(48 + frac % 10); i += 1
+                    return i
+                }
             default:
                 let bits = rng.int(4, 7)
-                text = (0..<bits).map { _ in String(rng.int(0, 1)) }.joined()
+                text = String(unsafeUninitializedCapacity: bits) { buf in
+                    // Drawn in the same order the `map` drew them.
+                    for i in 0..<bits { buf[i] = UInt8(48 + rng.int(0, 1)) }
+                    return bits
+                }
             }
             let size = rng.int(Draw.numberSize)
             let vertical = rng.unit() < Double(Draw.numberVerticalChance)

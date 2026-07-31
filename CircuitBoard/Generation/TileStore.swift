@@ -198,7 +198,19 @@ final class TileStore: @unchecked Sendable {
                     self.ring.abandon(claim.slot, index: index, epoch: claim.epoch)
                 }
                 self.lock.lock()
-                self.pool.append((generator, scratch))
+                // Only keep what the lane can actually use again. The pool has
+                // no other bound, so it settles at the high-water mark of
+                // concurrent workers — and that mark is set during the launch
+                // burst, which runs `activeProcessorCount - 2` workers against
+                // cruise's three. Every entry above the cruise count is a
+                // routing grid, an A* arena and a megabyte of glyph canvas that
+                // is never popped again: about 3.3 MB each, held for the life of
+                // the app. Dropping them here rather than in `endBurst` is what
+                // makes it stick, because the burst workers still in flight go
+                // on returning generators long after the burst is over.
+                if self.pool.count < self.currentLane.workers {
+                    self.pool.append((generator, scratch))
+                }
                 self.lock.unlock()
             }
         }

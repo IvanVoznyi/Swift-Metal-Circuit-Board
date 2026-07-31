@@ -18,17 +18,36 @@ enum TextRaster {
 
     /// The same, for a caller that already holds the font. Building a `CTFont`
     /// is not free, and the rasteriser needs one anyway.
+    ///
+    /// The three buffers are temporary allocations rather than arrays. Core Text
+    /// wants contiguous storage, not `Array` specifically, and the strings here
+    /// are silkscreen numbers — three to eight characters — so the storage fits
+    /// the stack. As `[…]` it was three heap objects per call and this is the
+    /// single most allocation-heavy call in generation, once per candidate
+    /// number placement.
     static func width(_ text: String, font f: CTFont) -> Float {
-        var glyphs = [CGGlyph](repeating: 0, count: text.utf16.count)
-        let chars = Array(text.utf16)
-        guard CTFontGetGlyphsForCharacters(f, chars, &glyphs, chars.count) else {
-            // Fall back to the nominal monospace advance. `CTFontGetSize`
-            // returns exactly the size the font was created with.
-            return Float(CTFontGetSize(f)) * 0.6 * Float(text.count)
+        let n = text.utf16.count
+        guard n > 0 else { return 0 }
+        return withUnsafeTemporaryAllocation(of: UniChar.self, capacity: n) { chars in
+            var k = 0
+            for u in text.utf16 { chars[k] = u; k += 1 }
+            return withUnsafeTemporaryAllocation(of: CGGlyph.self, capacity: n) { glyphs in
+                guard CTFontGetGlyphsForCharacters(f, chars.baseAddress!,
+                                                   glyphs.baseAddress!, n) else {
+                    // Fall back to the nominal monospace advance. `CTFontGetSize`
+                    // returns exactly the size the font was created with.
+                    return Float(CTFontGetSize(f)) * 0.6 * Float(text.count)
+                }
+                return withUnsafeTemporaryAllocation(of: CGSize.self, capacity: n) { adv in
+                    CTFontGetAdvancesForGlyphs(f, .horizontal, glyphs.baseAddress!,
+                                               adv.baseAddress!, n)
+                    // Summed left to right in `CGFloat`, as `reduce` did.
+                    var sum: CGFloat = 0
+                    for i in 0..<n { sum += adv[i].width }
+                    return Float(sum)
+                }
+            }
         }
-        var advances = [CGSize](repeating: .zero, count: glyphs.count)
-        CTFontGetAdvancesForGlyphs(f, .horizontal, glyphs, &advances, glyphs.count)
-        return Float(advances.reduce(0) { $0 + $1.width })
     }
 
     /// Canvas' `textBaseline = 'middle'` puts the em box's centre on the given
