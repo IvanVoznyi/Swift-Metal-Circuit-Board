@@ -2,6 +2,12 @@ import CoreGraphics
 import Foundation
 import simd
 
+private struct Label {
+    var text: String
+    var size: CGFloat
+    var x: Float
+    var y: Float
+}
 /// Generates one tile of board, deterministically, from `(world, index)`.
 ///
 /// One instance is reusable across tiles so the routing grid and the A* arena
@@ -22,7 +28,9 @@ final class TileGenerator {
     let grid: RoutingGrid
     let router: Router
     private(set) var rng: Rng
-
+    private var labelBuffer: [Label] = []
+    private var textSiteBuffer: [SIMD2<Float>] = []
+    private var poolBuffer: [Int] = []
     var data = TileData()
     /// Pin rows handed to the fan-out router, as indices into `data.pads`.
     var combs: [[Int]] = []
@@ -31,12 +39,13 @@ final class TileGenerator {
     /// generator is pooled and reused across tiles, so this warms once per
     /// worker and never needs a lock.
     var textBitmaps: [String: TextRaster.Bitmap] = [:]
-
+    
+    
     /// The cluster makers a `parts` slot can draw, in the original's order —
     /// `pick` indexes this list, so reordering it changes every board.
     enum Maker { case dip, matrix, comb, ring, fingers }
     static let makers: [Maker] = [.dip, .matrix, .comb, .ring, .fingers]
-
+    
     init(params: BoardParams) {
         self.params = params
         geo = params.geometry
@@ -44,7 +53,7 @@ final class TileGenerator {
         router = Router(grid: grid)
         rng = Rng(seed: 1)
     }
-
+    
     /// Points this generator at the same board with different counts — what the
     /// inner parallax layers ask for. Rejected if the geometry differs, because
     /// the grid buffers are sized from it and allocated once.
@@ -53,9 +62,9 @@ final class TileGenerator {
         params = new
         return true
     }
-
+    
     // MARK: - Entry point
-
+    
     func generate(index: Int) -> TileData {
         rng = Rng(seed: Rng.hash(params.world, signed: index + Int(Seam.tileSalt)))
         data = TileData()
@@ -63,47 +72,61 @@ final class TileGenerator {
         chipSeq = 0
         grid.clear()
         router.hugMultiplier = params.hugMultiplier
-
+        
         let width = geo.width
-
+        
         // ── 0. Reference designators reserve letter-shaped keepout ─────────
-        struct Label {
-            var text: String
-            var size: CGFloat
-            var x: Float
-            var y: Float
-        }
-        var labels: [Label] = []
+        labelBuffer.removeAll(keepingCapacity: true)
+        
         // Tile 0 keeps its marker even though the board now runs both ways.
         if index == 0 {
-            labels.append(Label(text: Draw.topLabel,
-                                size: CGFloat(Draw.topLabelSize),
-                                x: rng.float(55, 120), y: rng.float(40, 90)))
+            labelBuffer.append(Label(text: Draw.topLabel,
+                                     size: CGFloat(Draw.topLabelSize),
+                                     x: rng.float(55, 120), y: rng.float(40, 90)))
         }
         let labelCount = rng.int(1, 2 + TileGenerator.jsRound(geo.widthFactor))
         for _ in 0..<labelCount {
             let text = rng.pick(Draw.labelPrefixes) + String(rng.int(1, 99))
             let size = CGFloat(rng.int(Draw.labelSize))
-            labels.append(Label(text: text, size: size,
-                                x: rng.float(50, width - 90),
-                                y: rng.float(30, Board.tileHeight - 30)))
+            labelBuffer.append(Label(text: text, size: size,
+                                     x: rng.float(50, width - 90),
+                                     y: rng.float(30, Board.tileHeight - 30)))
         }
-
-        var textSites: [SIMD2<Float>] = []
-        for label in labels {
-            textSites += TextRaster.glyphSites(label.text, size: label.size, bold: true,
-                                               x: label.x, y: label.y, tileWidth: width,
-                                               cache: &textBitmaps)
+        
+        textSiteBuffer.removeAll(keepingCapacity: true)
+        for label in labelBuffer {
+            // NOTE: this still calls into TextRaster.glyphSites, which today
+            // allocates and returns its own [SIMD2<Float>] and then gets
+            // concatenated on with +=. That's a second alloc+copy per label on
+            // top of textSiteBuffer's own growth. To make this truly zero-alloc,
+            // give TextRaster an inout-appending overload:
+            //
+            //   static func glyphSites(_ text: String, size: CGFloat, bold: Bool,
+            //                          x: Float, y: Float, tileWidth: Float,
+            //                          cache: inout [...],
+            //                          into sites: inout [SIMD2<Float>])
+            //
+            // and have it append directly into textSiteBuffer instead of
+            // returning a fresh array. Once that exists, replace the two lines
+            // below with a single call:
+            //
+            //   TextRaster.glyphSites(label.text, size: label.size, bold: true,
+            //                         x: label.x, y: label.y, tileWidth: width,
+            //                         cache: &textBitmaps, into: &textSiteBuffer)
+            let sites = TextRaster.glyphSites(label.text, size: label.size, bold: true,
+                                              x: label.x, y: label.y, tileWidth: width,
+                                              cache: &textBitmaps)
+            textSiteBuffer.append(contentsOf: sites)
         }
-
+        
         // Each covered lattice point reserves a cell, so copper flows around
         // the letter shapes rather than through them.
-        for s in textSites {
+        for s in textSiteBuffer {
             let gx = TileGenerator.jsRound((s.x - geo.originX) / Board.gridSize)
             let gy = TileGenerator.jsRound((s.y - Board.originY) / Board.gridSize)
             grid.markCell(gx, gy, 1)
         }
-
+        
         // ── 1. Seam ports, decided before anything is placed ────────────────
         // Their inward lanes are reserved up front, otherwise a footprint lands
         // on the boundary column and the trace that should cross the seam never
@@ -114,7 +137,7 @@ final class TileGenerator {
         seamPorts += edgePorts(index + 1).map { p -> SeamPort in
             var q = p; q.row = Board.rows - 1; return q
         }
-
+        
         // One reserved lane PER PORT, released only when that port's turn
         // comes. Releasing them all at once meant the first seam trace could
         // route straight through a later port's lane, so that port had nowhere
@@ -136,7 +159,7 @@ final class TileGenerator {
             }
             return cells
         }
-
+        
         // ── 2. Footprints first — they define where the copper has to go ────
         // The chip goes before everything else: it needs the largest clear
         // square on the board, so it has to ask while the board is still empty.
@@ -164,9 +187,12 @@ final class TileGenerator {
             makeDecor(rng.int(Rates.decorCount))
         }
         grid.rebuildHug()
-
-        var pool = Array(data.pads.indices)
-
+        
+        poolBuffer.removeAll(keepingCapacity: true)
+        poolBuffer.append(contentsOf: data.pads.indices)
+        var pool = poolBuffer // still a value-type copy-on-write handle;
+        // see note below on why this line stays
+        
         // ── 3. Seam traces first, each with its own lane opened just for it ─
         // The fallback only needs a via inside that lane, so a seam port
         // essentially always produces a trace and both tiles agree on the
@@ -179,14 +205,14 @@ final class TileGenerator {
                 data.traces.append(t)
             }
         }
-
+        
         // ── 4. Main roads — thick rails across the open board ───────────────
         for _ in 0..<params.railCount {
             if let t = padTrace(&pool, cls: .main, color: rng.pick(palette.traces)) {
                 data.traces.append(t)
             }
         }
-
+        
         // ── 5. Fan-out combs — routed in order so each escape hugs its
         //       neighbour ────────────────────────────────────────────────────
         for row in combs {
@@ -199,9 +225,8 @@ final class TileGenerator {
                 // Take the comb pad out of the pool first — otherwise a later
                 // padTrace can pick it again and both traces converge on the
                 // same pad centre.
-                if let own = pool.firstIndex(of: p) { pool.remove(at: own) }
                 guard let a = padPort(p, keepout: r) else { continue }
-
+                
                 var b: SIMD2<Int32>?
                 var combPath: [SIMD2<Int32>]?
                 var target: Int?
@@ -210,17 +235,38 @@ final class TileGenerator {
                     k += 1
                     let i = rng.int(0, pool.count - 1)
                     let candidate = pool[i]
-                    if data.pads[candidate].taken || row.contains(candidate) { continue }
-                    // A chip pin never escapes to another pin of the same chip.
+                    
+                    // 1. Lazy cleanup: If we randomly hit a pad that is already taken,
+                    // instantly remove it from the pool so we never pick it again.
+                    if data.pads[candidate].taken {
+                        pool.swapRemove(at: i)
+                        k -= 1 // Don't count this as a wasted try
+                        continue
+                    }
+                    
+                    // 2. We can't route to pads in the current comb row, but we
+                    // leave them in the pool for later.
+                    if row.contains(candidate) { continue }
+                    
+                    // 3. A chip pin never escapes to another pin of the same chip.
                     if data.pads[p].chip != 0,
                        data.pads[candidate].chip == data.pads[p].chip { continue }
+                    
+                    // 4. Try to route
                     guard let hit = routeToPad(from: a, pad: candidate, keepout: r, via: {
                         router.route(from: a, to: $0, keepout: r)
                     }) else { continue }
-                    b = hit.port; combPath = hit.path; target = candidate
-                    pool.remove(at: i)
+                    
+                    // 5. Success! Route is found.
+                    b = hit.port
+                    combPath = hit.path
+                    target = candidate
+                    
+                    // We successfully used this candidate, so remove it from the pool in O(1) time
+                    pool.swapRemove(at: i)
                     break
                 }
+                
                 if b == nil {
                     guard let c = grid.freeCell(rng, keepout: r) else { continue }
                     guard let v = endVia(Int(c.x), Int(c.y)) else { continue }
@@ -233,7 +279,7 @@ final class TileGenerator {
                 }
                 guard let end = b,
                       let path = combPath ?? router.route(from: a, to: end, keepout: r)
-                else { continue }
+                        else { continue }
                 // The escape's own stub is drawn too. If it doubles back over
                 // the route, drop this pin rather than draw the wedge.
                 if stubDoublesBack(path, port: a, pad: p, fromStart: true) { continue }
@@ -244,7 +290,7 @@ final class TileGenerator {
                                          padA: p, padB: target))
             }
         }
-
+        
         // ── 6. Buses — one seeded member, the rest follow it through the hug
         //       field ────────────────────────────────────────────────────────
         for _ in 0..<params.busCount {
@@ -256,7 +302,7 @@ final class TileGenerator {
                 }
             }
         }
-
+        
         // ── 7. Ordinary signals, then a meander or two in whatever is left ──
         for _ in 0..<params.traceCount {
             let cls: TraceClass = rng.unit() < Double(Rates.fineOverSignal) ? .fine : .signal
@@ -269,60 +315,86 @@ final class TileGenerator {
                 data.traces.append(t)
             }
         }
-
+        
         // ── 8. Numbers last, so they only take space nothing else wanted ────
         data.numbers = makeNumbers(params.numberCount)
-
+        
         return data
     }
-
+    
     // MARK: - Pad-to-pad routing
-
+    
     func padTrace(_ pool: inout [Int], cls: TraceClass, color: SIMD3<Float>) -> Trace? {
         guard pool.count >= 2 else { return nil }
         let w = cls.width
         let r = RoutingGrid.keepout(w)
         var attempt = 0
+        
         while attempt < Routing.padTraceTries && pool.count > 1 {
             attempt += 1
+            
+            // 1. Pick first pad and lazy-clean if it's dead
             let ia = rng.int(0, pool.count - 1)
+            let ai = pool[ia]
+            if data.pads[ai].taken {
+                pool.swapRemove(at: ia)
+                attempt -= 1 // Don't count cleanup as a wasted routing attempt
+                continue
+            }
+            
+            // 2. Pick second pad and lazy-clean if it's dead
             var ib = rng.int(0, pool.count - 1)
             if ia == ib { ib = (ib + 1) % pool.count }
-            let ai = pool[ia], bi = pool[ib]
-            let a = data.pads[ai], b = data.pads[bi]
-            if a.taken || b.taken { continue }
+            let bi = pool[ib]
+            if data.pads[bi].taken {
+                pool.swapRemove(at: ib)
+                attempt -= 1 // Don't count cleanup as a wasted routing attempt
+                continue
+            }
+            
+            // 3. Both pads are valid and available.
+            let a = data.pads[ai]
+            let b = data.pads[bi]
+            
             // Never wire two pins of one chip together.
             if a.chip != 0 && a.chip == b.chip { continue }
+            
+            // Check Manhattan distance
             if abs(a.gx - b.gx) + abs(a.gy - b.gy) < 7 { continue }
-            // Both ends get the same treatment: a port is only right if the
-            // stub it leaves behind carries on the way the route runs.
+            
+            // 4. Try to route
             var best: [SIMD2<Int32>]?
             forEachPadPort(ai, keepout: r, toward: SIMD2(Int32(b.gx), Int32(b.gy))) { pa in
                 guard let hit = routeToPad(from: pa, pad: bi, keepout: r, via: {
                     router.route(from: pa, to: $0, keepout: r)
                 }) else { return false }
-                // Both stubs are drawn, so both have to carry on the way the
-                // route runs. No port that does, no trace: there are nine more
-                // pairs to try.
+                
                 if !stubDoublesBack(hit.path, port: pa, pad: ai, fromStart: true) {
                     best = hit.path
                     return true
                 }
                 return false
             }
+            
             guard let path = best else { continue }
+            
+            // 5. Success! Claim the route and mark pads taken.
             grid.claim(path, width: w)
             data.pads[ai].taken = true
             data.pads[bi].taken = true
-            pool.remove(at: max(ia, ib))
-            pool.remove(at: min(ia, ib))
+            
+            // O(1) removal. MUST remove max first so the min index doesn't shift!
+            pool.swapRemove(at: max(ia, ib))
+            pool.swapRemove(at: min(ia, ib))
+            
             return Trace(path: path, color: color, width: w, cls: cls, padA: ai, padB: bi)
         }
+        
         return nil
     }
-
+    
     // MARK: - Serpentine length-matching meander
-
+    
     private func lineCells(_ a: SIMD2<Int>, _ b: SIMD2<Int>, into out: inout [SIMD2<Int32>]) {
         var x = a.x, y = a.y
         let sx = (b.x - x).signum(), sy = (b.y - y).signum()
@@ -332,9 +404,14 @@ final class TileGenerator {
             out.append(SIMD2(Int32(x), Int32(y)))
         }
     }
-
+    
     func makeMeander(color: SIMD3<Float>) -> Trace? {
         let w = TraceClass.signal.width
+        var pts: [SIMD2<Int32>] = []
+        // Optional micro-optimization: Pre-allocate enough space for the maximum possible meander size
+        // Max folds (7) * 2 * (Max amp (6) + Max half (3)) = ~126 points
+        pts.reserveCapacity(130)
+        
         for _ in 0..<Routing.meanderTries {
             let folds = rng.int(3, 7)
             let amp = rng.int(3, 6)
@@ -344,9 +421,13 @@ final class TileGenerator {
             let gy = rng.int(2 + amp, Board.rows - 3 - amp)
             if gx < 2 || gy < 2 || wCells < 2 { continue }
             guard grid.boxFree(gx - 1, gy - amp - 1, gx + wCells + 1, gy + amp + 1)
-            else { continue }
-
-            var pts: [SIMD2<Int32>] = [SIMD2(Int32(gx), Int32(gy))]
+                    else { continue }
+            
+            // Clear the array from previous failed attempts without deallocating memory,
+            // then add the starting point back.
+            pts.removeAll(keepingCapacity: true)
+            pts.append(SIMD2(Int32(gx), Int32(gy)))
+            
             var x = gx
             var up = 1
             for _ in 0..<folds {
@@ -369,9 +450,9 @@ final class TileGenerator {
         }
         return nil
     }
-
+    
     // MARK: - Silkscreen numbers
-
+    
     /// Placement is the whole point: each candidate is measured, turned into a
     /// cell footprint, tested against `occ` — which by the time this runs holds
     /// every trace corridor, pad keepout and label keepout — and then marked.
@@ -394,10 +475,14 @@ final class TileGenerator {
             return digits
         }
     }
-
+    
     func makeNumbers(_ n: Int) -> [NumberLabel] {
         var out: [NumberLabel] = []
+        out.reserveCapacity(n) // Prevent array reallocation overhead
         var tries = 0
+        
+        let gridSizeFloat = Float(Board.gridSize) // Cache this if it's a static/global constant to avoid repeated lookups
+        
         while out.count < n && tries < n * Draw.numberTries {
             tries += 1
             let kind = rng.int(0, 3)
@@ -406,8 +491,7 @@ final class TileGenerator {
             case 0:
                 text = TileGenerator.digits(rng.int(0, 999), 3)
             case 1:
-                // "0x" then one or two uppercase hex digits, unpadded — what
-                // `String(_:radix:uppercase:)` produced.
+                // "0x" then one or two uppercase hex digits, unpadded
                 let v = rng.int(0, 255)
                 text = String(unsafeUninitializedCapacity: 4) { buf in
                     func hex(_ d: Int) -> UInt8 { d < 10 ? UInt8(48 + d) : UInt8(55 + d) }
@@ -419,7 +503,6 @@ final class TileGenerator {
             case 2:
                 let whole = rng.int(0, 99)
                 let frac = rng.int(0, 99)
-                // The whole part is unpadded, the fraction is two digits.
                 let wide = whole > 9
                 text = String(unsafeUninitializedCapacity: wide ? 5 : 4) { buf in
                     var i = 0
@@ -433,7 +516,6 @@ final class TileGenerator {
             default:
                 let bits = rng.int(4, 7)
                 text = String(unsafeUninitializedCapacity: bits) { buf in
-                    // Drawn in the same order the `map` drew them.
                     for i in 0..<bits { buf[i] = UInt8(48 + rng.int(0, 1)) }
                     return bits
                 }
@@ -441,12 +523,15 @@ final class TileGenerator {
             let size = rng.int(Draw.numberSize)
             let vertical = rng.unit() < Double(Draw.numberVerticalChance)
             let tw = TextRaster.width(text, size: CGFloat(size))
-            // Half-extents in px, plus a margin so a trace's halo never grazes
-            // a digit.
+            
+            // Half-extents in px, plus a margin
             let ex = (vertical ? Float(size) : tw) / 2 + Draw.numberMargin
             let ey = (vertical ? tw : Float(size)) / 2 + Draw.numberMargin
-            let rx = Int((Double(ex) / Double(Board.gridSize)).rounded(.up))
-            let ry = Int((Double(ey) / Double(Board.gridSize)).rounded(.up))
+            
+            // Fast Float ceiling math instead of Double casting and .rounded(.up)
+            let rx = Int(ceilf(ex / gridSizeFloat))
+            let ry = Int(ceilf(ey / gridSizeFloat))
+            
             if rx * 2 + 1 >= grid.cols || ry * 2 + 1 >= Board.rows { continue }
             let gx = rng.int(rx, grid.cols - 1 - rx)
             let gy = rng.int(ry, Board.rows - 1 - ry)
@@ -457,5 +542,15 @@ final class TileGenerator {
                                    alpha: rng.float(Draw.numberAlpha)))
         }
         return out
+    }
+}
+
+
+extension Array {
+    mutating func swapRemove(at index: Int) {
+        if index != count - 1 {
+            swapAt(index, count - 1)
+        }
+        removeLast()
     }
 }
