@@ -38,7 +38,7 @@ final class TileGenerator {
     /// Rasterised label bitmaps, kept for the life of this generator. A
     /// generator is pooled and reused across tiles, so this warms once per
     /// worker and never needs a lock.
-    var textBitmaps: [String: TextRaster.Bitmap] = [:]
+    var textBitmaps: [TextRaster.CacheKey: TextRaster.Bitmap] = [:]
     
     
     /// The cluster makers a `parts` slot can draw, in the original's order —

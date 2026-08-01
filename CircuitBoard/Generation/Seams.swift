@@ -31,6 +31,7 @@ extension TileGenerator {
 
         let n = max(2, rng.int(3, 4 + TileGenerator.jsRound(geo.width / 260)))
         var out: [SeamPort] = []
+        out.reserveCapacity(n)
         // Ports must be spaced apart, not merely distinct: two ports a column
         // or two apart meant the first trace's keepout blocked the second, so
         // that column got a trace on one side of the seam and nothing on the
@@ -140,8 +141,10 @@ extension TileGenerator {
     /// Does the path come back to the seam row while the eye still reads it as
     /// the same place?
     private func returnsToSeam(_ path: [SIMD2<Int32>], row: Int) -> Bool {
-        for c in path.dropFirst().prefix(Routing.stubWindow) where Int(c.y) == row {
-            return true
+        // OPTIMIZED: Direct index iteration avoids ArraySlice allocations
+        let limit = min(path.count, Routing.stubWindow + 1)
+        for i in 1..<limit {
+            if Int(path[i].y) == row { return true }
         }
         return false
     }
@@ -200,7 +203,9 @@ extension TileGenerator {
                     routeFromSeam(port, to: $0, keepout: r)
                 }) else { continue }
                 b = hit.port; seamPath = hit.path; padB = p
-                pool.remove(at: i)
+                
+                // OPTIMIZED: O(1) removal instead of O(N) shifting
+                pool.swapRemove(at: i)
                 break
             }
         }
