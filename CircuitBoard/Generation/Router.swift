@@ -725,14 +725,31 @@ final class Router {
         }
 
         guard found else { return nil }
-        var path: [SIMD2<Int32>] = []
+
+        // Two walks of the `cameFrom` chain, not one.
+        //
+        // Appending into an empty array grew it through every power of two on
+        // the way to a forty-cell path — seven allocations and seven copies —
+        // and then `reverse()` walked it again. Counting first costs a second
+        // pass over a chain that is already in cache and turns the whole thing
+        // into one exact-sized allocation, filled back to front so the reversal
+        // disappears too. This runs about a hundred times a tile and was the
+        // largest single source of allocation in generation.
+        var length = 0
         var c = goal
         while c != -1 {
-            path.append(SIMD2(Int32(c % cols), Int32(c / cols)))
-            let prev = visitStamp[c] == gen ? Int(cameFrom[c]) : -1
-            c = prev
+            length += 1
+            c = visitStamp[c] == gen ? Int(cameFrom[c]) : -1
         }
-        path.reverse()
-        return path
+        return [SIMD2<Int32>](unsafeUninitializedCapacity: length) { buf, initialised in
+            var c = goal
+            var i = length - 1
+            while c != -1 {
+                buf[i] = SIMD2(Int32(c % cols), Int32(c / cols))
+                i -= 1
+                c = visitStamp[c] == gen ? Int(cameFrom[c]) : -1
+            }
+            initialised = length
+        }
     }
 }

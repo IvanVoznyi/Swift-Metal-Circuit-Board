@@ -203,9 +203,8 @@ extension TileGenerator {
                     routeFromSeam(port, to: $0, keepout: r)
                 }) else { continue }
                 b = hit.port; seamPath = hit.path; padB = p
-                
-                // OPTIMIZED: O(1) removal instead of O(N) shifting
-                pool.swapRemove(at: i)
+
+                pool.remove(at: i)
                 break
             }
         }

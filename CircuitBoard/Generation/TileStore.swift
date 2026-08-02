@@ -51,6 +51,9 @@ final class TileStore: @unchecked Sendable {
     /// Tiles the ring may not evict, carried alongside `pending` because a
     /// worker claims its slot when it starts, not when it was asked for.
     private var keep: Set<Int> = []
+    /// Everything asked for this frame, visible and prefetch alike. The ring
+    /// needs it to know which slots are safe to evict.
+    private var wanted: Set<Int> = []
     private var running = 0
 
     private let lock = NSLock()
@@ -106,6 +109,18 @@ final class TileStore: @unchecked Sendable {
         pool.removeAll(keepingCapacity: true)
         inFlight.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
+        // Straight onto the launch lane. The argument for bursting is that
+        // nothing valid is on screen, and a slider change has just made that
+        // true of every tile — the same situation as launch, arrived at from a
+        // different direction. Measured on the visible thirty: 110 ms to come
+        // back on cruise's three workers against 44 ms on the burst lane.
+        //
+        // `running` is deliberately left alone. Workers already in flight still
+        // occupy their slots and still decrement it when they finish, so it
+        // stays balanced; `inFlight` is cleared because those tiles are no
+        // longer wanted, which is a different question from how many workers
+        // are busy.
+        bursting = true
         lock.unlock()
         // Bumps the ring's epoch, so results already in flight are dropped
         // rather than written into a slot someone else now owns.
@@ -125,8 +140,12 @@ final class TileStore: @unchecked Sendable {
     func request(_ indices: [Int], keeping keep: Set<Int>) {
         lock.lock()
         self.keep = keep
+        wanted.removeAll(keepingCapacity: true)
         pending.removeAll(keepingCapacity: true)
-        for index in indices where !inFlight.contains(index) { pending.append(index) }
+        for index in indices {
+            wanted.insert(index)
+            if !inFlight.contains(index) { pending.append(index) }
+        }
         lock.unlock()
         pump()
     }
@@ -139,6 +158,12 @@ final class TileStore: @unchecked Sendable {
     private func pump() {
         while true {
             lock.lock()
+            // Caught up: nothing queued and nobody working, so whatever put us
+            // on the launch lane is finished with. This is what lets `update`
+            // burst without a matching `endBurst` — the renderer's reveal is
+            // latched and only ever fires once, so a burst entered on a slider
+            // change has to end itself.
+            if pending.isEmpty && running == 0 { bursting = false }
             guard let currentFiller = filler, running < currentLane.workers,
                   !pending.isEmpty else { lock.unlock(); return }
             let index = pending.removeFirst()
@@ -146,6 +171,7 @@ final class TileStore: @unchecked Sendable {
             let currentParams = params
             let lane = currentLane
             let currentKeep = keep
+            let currentWanted = wanted
             inFlight.insert(index)
             running += 1
             lock.unlock()
@@ -157,13 +183,19 @@ final class TileStore: @unchecked Sendable {
             // No evictable slot: the ring is full of tiles that are on screen
             // or already generating. Give up for this frame rather than
             // spinning through the rest of the list to be told the same thing.
-            guard let claim = ring.claim(index, keeping: currentKeep) else {
+            guard let claim = ring.claim(index, keeping: currentKeep, wanted: currentWanted) else {
                 release(index)
                 return
             }
 
-            lane.queue.async { [weak self] in
-                guard let self else { return }
+            lane.queue.async { [weak self, ring] in
+                // The ring outlives the store on teardown, and the slot was
+                // claimed before this task was queued — so hand it back rather
+                // than leaving it stuck in `generating` forever.
+                guard let self else {
+                    ring.abandon(claim.slot, index: index, epoch: claim.epoch)
+                    return
+                }
                 defer { self.release(index); self.pump() }
 
                 // Taken from the pool, or built here — outside the lock, since

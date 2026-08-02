@@ -112,19 +112,58 @@ enum TextRaster {
         ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
         ctx.setFillColor(gray: 1, alpha: 1)
         
-        // Core Text keys rather than AppKit/UIKit ones, so this file stays
-        // free of a platform UI framework. The glyph colour comes from the
-        // context's fill colour, already set to white above.
-        let attrs: [NSAttributedString.Key: Any] = [
-            NSAttributedString.Key(kCTFontAttributeName as String): f,
-            NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true,
-        ]
-        let line = CTLineCreateWithAttributedString(
-            NSAttributedString(string: text, attributes: attrs))
         // Core Graphics is y-up; both callers are y-down. Draw at a baseline
         // that leaves `pad` of descent below, then flip when mapping back.
-        ctx.textPosition = CGPoint(x: pad, y: descent + pad)
-        CTLineDraw(line, ctx)
+        let baseline = descent + pad
+
+        // Everything drawn here is a single-font run of digits and Latin
+        // letters — no shaping, no bidi, no substitution — so the glyphs can go
+        // straight to the font at their own advances. That is all `CTLine` was
+        // doing, and it charged an attributes dictionary, an `NSAttributedString`
+        // and a `CTLine` for each one: measured at four hundred allocations and
+        // a fifth of a millisecond per tile, for twenty-five short numbers.
+        var drew = false
+        let n = text.utf16.count
+        if n > 0 {
+            withUnsafeTemporaryAllocation(of: UniChar.self, capacity: n) { chars in
+                var k = 0
+                for u in text.utf16 { chars[k] = u; k += 1 }
+                withUnsafeTemporaryAllocation(of: CGGlyph.self, capacity: n) { glyphs in
+                    // False means the font has no glyph for some character, and
+                    // only `CTLine` can substitute another font for it. Never
+                    // happens for this project's own text, but it is the reason
+                    // the slow path below stays.
+                    guard CTFontGetGlyphsForCharacters(f, chars.baseAddress!,
+                                                       glyphs.baseAddress!, n) else { return }
+                    withUnsafeTemporaryAllocation(of: CGSize.self, capacity: n) { adv in
+                        CTFontGetAdvancesForGlyphs(f, .horizontal, glyphs.baseAddress!,
+                                                   adv.baseAddress!, n)
+                        withUnsafeTemporaryAllocation(of: CGPoint.self, capacity: n) { pos in
+                            var x = pad
+                            for i in 0..<n {
+                                pos[i] = CGPoint(x: x, y: baseline)
+                                x += adv[i].width
+                            }
+                            CTFontDrawGlyphs(f, glyphs.baseAddress!, pos.baseAddress!, n, ctx)
+                            drew = true
+                        }
+                    }
+                }
+            }
+        }
+        if !drew {
+            // Core Text keys rather than AppKit/UIKit ones, so this file stays
+            // free of a platform UI framework. The glyph colour comes from the
+            // context's fill colour, already set to white above.
+            let attrs: [NSAttributedString.Key: Any] = [
+                NSAttributedString.Key(kCTFontAttributeName as String): f,
+                NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String): true,
+            ]
+            let line = CTLineCreateWithAttributedString(
+                NSAttributedString(string: text, attributes: attrs))
+            ctx.textPosition = CGPoint(x: pad, y: baseline)
+            CTLineDraw(line, ctx)
+        }
         
         guard let data = ctx.data else { return nil }
         let raw = data.bindMemory(to: UInt8.self, capacity: w * h)
@@ -178,7 +217,23 @@ enum TextRaster {
     static func glyphSites(_ text: String, size: CGFloat, bold: Bool,
                            x: Float, y: Float, tileWidth: Float,
                            cache: inout [CacheKey: Bitmap]) -> [SIMD2<Float>] {
-        
+        var out: [SIMD2<Float>] = []
+        glyphSites(text, size: size, bold: bold, x: x, y: y, tileWidth: tileWidth,
+                   cache: &cache, into: &out)
+        return out
+    }
+
+    /// The same, appending into the caller's own array.
+    ///
+    /// The returning form above hands back a fresh array that the caller then
+    /// copies into its own buffer — an allocation and a copy per label, on top
+    /// of the buffer's own growth. A caller that already has somewhere to put
+    /// the points can use this and have neither.
+    static func glyphSites(_ text: String, size: CGFloat, bold: Bool,
+                           x: Float, y: Float, tileWidth: Float,
+                           cache: inout [CacheKey: Bitmap],
+                           into out: inout [SIMD2<Float>]) {
+
         let key = CacheKey(text: text, size: size, bold: bold)
         let bm: Bitmap
         if let hit = cache[key] {
@@ -186,16 +241,16 @@ enum TextRaster {
         } else if let made = bitmap(text, size: size, bold: bold) {
             bm = made; cache[key] = made
         } else {
-            return []
+            return
         }
-        
+
         let cov = place(bm, x: x, y: y)
         let step = Float(Draw.glyphLattice)
-        var out: [SIMD2<Float>] = []
-        
-        // Pre-allocate assuming an average density to avoid mid-loop array resizing
-        out.reserveCapacity(Int(Float(cov.width * cov.height) / (step * step)) / 2)
-        
+
+        // Room for this label's share on top of whatever is already there.
+        out.reserveCapacity(out.count
+                            + Int(Float(cov.width * cov.height) / (step * step)) / 2)
+
         let maxY = min(Board.tileHeight, cov.originY + Float(cov.height))
         let maxX = min(tileWidth, cov.originX + Float(cov.width))
         
@@ -220,6 +275,5 @@ enum TextRaster {
             }
             r += 1
         }
-        return out
     }
 }

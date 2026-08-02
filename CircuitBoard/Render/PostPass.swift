@@ -82,6 +82,16 @@ final class PostPass {
         self.composite = comp
     }
 
+    /// Per-pass GPU timestamps, when the device supports them. Nil disables
+    /// every attachment below at no cost.
+    var timer: GPUTimer?
+
+    /// Ablation switches, for pricing a stage by removing it. Overlapping GPU
+    /// timestamps cannot be summed, so running a frame without a stage is the
+    /// only way to know what it costs.
+    static let skipBloom = ProcessInfo.processInfo.environment["PCB_SKIP"]?.contains("bloom") ?? false
+    static let skipDof   = ProcessInfo.processInfo.environment["PCB_SKIP"]?.contains("dof") ?? false
+
     // MARK: - Targets
 
     /// Returns true if the targets were rebuilt.
@@ -125,6 +135,7 @@ final class PostPass {
         d.colorAttachments[0].texture = targets.scene
         d.colorAttachments[0].loadAction = .dontCare   // the gradient covers every pixel
         d.colorAttachments[0].storeAction = .store
+        timer?.attach(to: d, name: "scene")
         guard let enc = command.makeRenderCommandEncoder(descriptor: d) else { return nil }
         enc.label = "scene"
         enc.setRenderPipelineState(background)
@@ -176,19 +187,22 @@ final class PostPass {
 
         // The blur, across then down. Skipped outright when there is no depth of
         // field — the flat view — rather than run with a zero radius.
-        let lit = options.dofStrength > 0
+        let lit = options.dofStrength > 0 && !PostPass.skipDof
         if lit {
-            blit(dofH, from: [accumulated], into: targets.halfBlurred, label: "depth of field · horizontal",
+            blit(dofH, from: [accumulated], into: targets.halfBlurred, label: "depth of field - horizontal",
                  uniforms: &post, in: command)
-            blit(dofV, from: [targets.halfBlurred], into: targets.focused, label: "depth of field · vertical",
+            blit(dofV, from: [targets.halfBlurred], into: targets.focused, label: "depth of field - vertical",
                  uniforms: &post, in: command)
         }
         let composited = lit ? targets.focused : accumulated
 
-        blit(prefilter, from: [composited], into: targets.bloomA, label: "bloom prefilter", in: command)
-        blit(blurH, from: [targets.bloomA], into: targets.bloomB, label: "bloom blur · horizontal", in: command)
-        blit(blurV, from: [targets.bloomB], into: targets.bloomA, label: "bloom blur · vertical", in: command)
+        if !PostPass.skipBloom {
+            blit(prefilter, from: [composited], into: targets.bloomA, label: "bloom prefilter", in: command)
+            blit(blurH, from: [targets.bloomA], into: targets.bloomB, label: "bloom blur - horizontal", in: command)
+            blit(blurV, from: [targets.bloomB], into: targets.bloomA, label: "bloom blur - vertical", in: command)
+        }
 
+        timer?.attach(to: drawableTarget, name: "composite")
         guard let enc = command.makeRenderCommandEncoder(descriptor: drawableTarget) else { return }
         enc.label = "composite"
         enc.setRenderPipelineState(composite)
@@ -203,6 +217,11 @@ final class PostPass {
     /// history on resize, which is the one time it is meaningless.
     func resetHistoryForTesting() { historyReady = false }
 
+    /// Keep every label ASCII. Instruments drops a pass label containing any
+    /// non-ASCII character — silently, showing the unnamed default instead — so
+    /// a tidy "depth of field . horizontal" with a middle dot loses exactly the
+    /// name it was written to provide. That has already cost two wasted captures.
+    ///
     /// `label` is not decoration: without it a GPU capture shows this chain as
     /// "Render Command 1…5" and there is no way to tell the bloom prefilter
     /// from the depth-of-field blur. The scene pass costs 295 µs; these five
@@ -216,6 +235,7 @@ final class PostPass {
         d.colorAttachments[0].texture = target
         d.colorAttachments[0].loadAction = .dontCare
         d.colorAttachments[0].storeAction = .store
+        timer?.attach(to: d, name: label)
         guard let enc = command.makeRenderCommandEncoder(descriptor: d) else { return }
         enc.label = label
         enc.setRenderPipelineState(pipeline)

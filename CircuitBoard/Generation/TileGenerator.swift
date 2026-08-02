@@ -95,28 +95,9 @@ final class TileGenerator {
         
         textSiteBuffer.removeAll(keepingCapacity: true)
         for label in labelBuffer {
-            // NOTE: this still calls into TextRaster.glyphSites, which today
-            // allocates and returns its own [SIMD2<Float>] and then gets
-            // concatenated on with +=. That's a second alloc+copy per label on
-            // top of textSiteBuffer's own growth. To make this truly zero-alloc,
-            // give TextRaster an inout-appending overload:
-            //
-            //   static func glyphSites(_ text: String, size: CGFloat, bold: Bool,
-            //                          x: Float, y: Float, tileWidth: Float,
-            //                          cache: inout [...],
-            //                          into sites: inout [SIMD2<Float>])
-            //
-            // and have it append directly into textSiteBuffer instead of
-            // returning a fresh array. Once that exists, replace the two lines
-            // below with a single call:
-            //
-            //   TextRaster.glyphSites(label.text, size: label.size, bold: true,
-            //                         x: label.x, y: label.y, tileWidth: width,
-            //                         cache: &textBitmaps, into: &textSiteBuffer)
-            let sites = TextRaster.glyphSites(label.text, size: label.size, bold: true,
-                                              x: label.x, y: label.y, tileWidth: width,
-                                              cache: &textBitmaps)
-            textSiteBuffer.append(contentsOf: sites)
+            TextRaster.glyphSites(label.text, size: label.size, bold: true,
+                                  x: label.x, y: label.y, tileWidth: width,
+                                  cache: &textBitmaps, into: &textSiteBuffer)
         }
         
         // Each covered lattice point reserves a cell, so copper flows around
@@ -188,10 +169,14 @@ final class TileGenerator {
         }
         grid.rebuildHug()
         
+        // Reused across tiles, and used *in place*. Binding it to a local
+        // (`var pool = poolBuffer`) keeps `poolBuffer` referencing the same
+        // storage, so the first mutation copies the whole thing — the reuse
+        // buys one allocation and then pays for a full copy, which is worse
+        // than just allocating. Everything below therefore mutates the
+        // property directly.
         poolBuffer.removeAll(keepingCapacity: true)
         poolBuffer.append(contentsOf: data.pads.indices)
-        var pool = poolBuffer // still a value-type copy-on-write handle;
-        // see note below on why this line stays
         
         // ── 3. Seam traces first, each with its own lane opened just for it ─
         // The fallback only needs a via inside that lane, so a seam port
@@ -199,7 +184,7 @@ final class TileGenerator {
         // column.
         for (i, port) in seamPorts.enumerated() {
             grid.release(reserved[i])
-            if let t = edgeTrace(port, pool: &pool) {
+            if let t = edgeTrace(port, pool: &poolBuffer) {
                 data.traces.append(t)
             } else if let t = seamFallback(port) {
                 data.traces.append(t)
@@ -208,7 +193,7 @@ final class TileGenerator {
         
         // ── 4. Main roads — thick rails across the open board ───────────────
         for _ in 0..<params.railCount {
-            if let t = padTrace(&pool, cls: .main, color: rng.pick(palette.traces)) {
+            if let t = padTrace(&poolBuffer, cls: .main, color: rng.pick(palette.traces)) {
                 data.traces.append(t)
             }
         }
@@ -225,45 +210,37 @@ final class TileGenerator {
                 // Take the comb pad out of the pool first — otherwise a later
                 // padTrace can pick it again and both traces converge on the
                 // same pad centre.
+                //
+                // Order-preserving on purpose. A swap-and-pop removal is O(1)
+                // against this O(n), and it was tried: it moves the last pad
+                // into the hole, which changes what `rng.int(0, count - 1)`
+                // selects next, which changes every board. Measured at +1%, and
+                // the pool is at most a couple of hundred Ints — the shift was
+                // never the cost.
+                if let own = poolBuffer.firstIndex(of: p) { poolBuffer.remove(at: own) }
                 guard let a = padPort(p, keepout: r) else { continue }
-                
+
                 var b: SIMD2<Int32>?
                 var combPath: [SIMD2<Int32>]?
                 var target: Int?
                 var k = 0
-                while k < Routing.combProbeTries && !pool.isEmpty {
+                while k < Routing.combProbeTries && !poolBuffer.isEmpty {
                     k += 1
-                    let i = rng.int(0, pool.count - 1)
-                    let candidate = pool[i]
-                    
-                    // 1. Lazy cleanup: If we randomly hit a pad that is already taken,
-                    // instantly remove it from the pool so we never pick it again.
-                    if data.pads[candidate].taken {
-                        pool.swapRemove(at: i)
-                        k -= 1 // Don't count this as a wasted try
-                        continue
-                    }
-                    
-                    // 2. We can't route to pads in the current comb row, but we
-                    // leave them in the pool for later.
-                    if row.contains(candidate) { continue }
-                    
-                    // 3. A chip pin never escapes to another pin of the same chip.
+                    let i = rng.int(0, poolBuffer.count - 1)
+                    let candidate = poolBuffer[i]
+                    // Skipped, not evicted. Evicting a taken pad here without
+                    // spending a probe — "lazy cleanup" — leaves the pool full
+                    // of live entries but costs 4% of generation, because the
+                    // probe budget then no longer bounds the loop.
+                    if data.pads[candidate].taken || row.contains(candidate) { continue }
+                    // A chip pin never escapes to another pin of the same chip.
                     if data.pads[p].chip != 0,
                        data.pads[candidate].chip == data.pads[p].chip { continue }
-                    
-                    // 4. Try to route
                     guard let hit = routeToPad(from: a, pad: candidate, keepout: r, via: {
                         router.route(from: a, to: $0, keepout: r)
                     }) else { continue }
-                    
-                    // 5. Success! Route is found.
-                    b = hit.port
-                    combPath = hit.path
-                    target = candidate
-                    
-                    // We successfully used this candidate, so remove it from the pool in O(1) time
-                    pool.swapRemove(at: i)
+                    b = hit.port; combPath = hit.path; target = candidate
+                    poolBuffer.remove(at: i)
                     break
                 }
                 
@@ -297,7 +274,7 @@ final class TileGenerator {
             let color = rng.pick(palette.traces)
             let k = rng.int(Rates.busMembers)
             for _ in 0..<k {
-                if let t = padTrace(&pool, cls: .bus, color: color) {
+                if let t = padTrace(&poolBuffer, cls: .bus, color: color) {
                     data.traces.append(t)
                 }
             }
@@ -306,7 +283,7 @@ final class TileGenerator {
         // ── 7. Ordinary signals, then a meander or two in whatever is left ──
         for _ in 0..<params.traceCount {
             let cls: TraceClass = rng.unit() < Double(Rates.fineOverSignal) ? .fine : .signal
-            if let t = padTrace(&pool, cls: cls, color: rng.pick(palette.traces)) {
+            if let t = padTrace(&poolBuffer, cls: cls, color: rng.pick(palette.traces)) {
                 data.traces.append(t)
             }
         }
@@ -333,26 +310,11 @@ final class TileGenerator {
         while attempt < Routing.padTraceTries && pool.count > 1 {
             attempt += 1
             
-            // 1. Pick first pad and lazy-clean if it's dead
             let ia = rng.int(0, pool.count - 1)
-            let ai = pool[ia]
-            if data.pads[ai].taken {
-                pool.swapRemove(at: ia)
-                attempt -= 1 // Don't count cleanup as a wasted routing attempt
-                continue
-            }
-            
-            // 2. Pick second pad and lazy-clean if it's dead
             var ib = rng.int(0, pool.count - 1)
             if ia == ib { ib = (ib + 1) % pool.count }
-            let bi = pool[ib]
-            if data.pads[bi].taken {
-                pool.swapRemove(at: ib)
-                attempt -= 1 // Don't count cleanup as a wasted routing attempt
-                continue
-            }
-            
-            // 3. Both pads are valid and available.
+            let ai = pool[ia], bi = pool[ib]
+            if data.pads[ai].taken || data.pads[bi].taken { continue }
             let a = data.pads[ai]
             let b = data.pads[bi]
             
@@ -383,9 +345,8 @@ final class TileGenerator {
             data.pads[ai].taken = true
             data.pads[bi].taken = true
             
-            // O(1) removal. MUST remove max first so the min index doesn't shift!
-            pool.swapRemove(at: max(ia, ib))
-            pool.swapRemove(at: min(ia, ib))
+            pool.remove(at: max(ia, ib))
+            pool.remove(at: min(ia, ib))
             
             return Trace(path: path, color: color, width: w, cls: cls, padA: ai, padB: bi)
         }
@@ -545,12 +506,3 @@ final class TileGenerator {
     }
 }
 
-
-extension Array {
-    mutating func swapRemove(at index: Int) {
-        if index != count - 1 {
-            swapAt(index, count - 1)
-        }
-        removeLast()
-    }
-}

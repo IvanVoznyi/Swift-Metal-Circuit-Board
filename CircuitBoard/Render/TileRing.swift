@@ -245,7 +245,16 @@ final class TileRing: Sendable {
     /// `keep` is a set rather than a range because the parallax layers each
     /// draw their own stretch of the board: what is on screen is several
     /// disjoint runs of indices, not one.
-    func claim(_ index: Int, keeping keep: Set<Int>) -> (slot: Int, epoch: UInt64)? {
+    /// `wanted` is everything the renderer asked for this frame — the visible
+    /// tiles *and* the prefetch ring around them. `keep` is only what is on
+    /// screen. Evicting from `wanted` is what to avoid: those tiles are about to
+    /// be asked for again, so throwing one out buys a slot and immediately
+    /// spends a tile of routing to get it back. Measured before this
+    /// distinction existed, the ring was regenerating about three hundred and
+    /// thirty tiles a second to stand still — three cores, permanently, for a
+    /// board that needs a new tile every eight seconds.
+    func claim(_ index: Int, keeping keep: Set<Int>,
+               wanted: Set<Int>) -> (slot: Int, epoch: UInt64)? {
         book.withLock { b -> (slot: Int, epoch: UInt64)? in
             guard b.slotCount > 0 else { return nil }
             if let existing = b.tileIndex.firstIndex(of: index),
@@ -256,15 +265,21 @@ final class TileRing: Sendable {
             if let free = b.state.firstIndex(of: .free) {
                 chosen = free
             } else {
-                // Evict any tile that is neither on screen nor mid-flight. They
-                // are all equally unwanted — the caller asked for every index it
-                // cares about — so the first one found will do.
+                // Two tiers. First choice is a tile nothing wants any more —
+                // scrolled past, or left over from a previous viewport. Only if
+                // there is no such slot does a wanted-but-offscreen prefetch
+                // tile get taken, which at least keeps the board progressing
+                // when the window is tall enough that the wanted set rivals the
+                // ring.
+                var fallback: Int?
                 for s in 0..<b.slotCount {
                     guard b.state[s] == .ready || b.state[s] == .filled else { continue }
-                    guard !keep.contains(b.tileIndex[s]) else { continue }
-                    chosen = s
-                    break
+                    let tile = b.tileIndex[s]
+                    guard !keep.contains(tile) else { continue }
+                    if !wanted.contains(tile) { chosen = s; break }
+                    if fallback == nil { fallback = s }
                 }
+                if chosen == nil { chosen = fallback }
             }
             guard let slot = chosen else { return nil }
             b.state[slot] = .generating

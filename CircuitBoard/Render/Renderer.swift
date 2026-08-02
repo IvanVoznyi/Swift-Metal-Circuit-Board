@@ -1,4 +1,5 @@
 import Foundation
+import os
 import MetalKit
 import QuartzCore
 import simd
@@ -53,6 +54,20 @@ final class Renderer: NSObject, MTKViewDelegate {
     /// Keeps the CPU from running more than a couple of frames ahead of the
     /// GPU, so a stall shows up as a stall rather than as unbounded latency.
     private let inFlight = DispatchSemaphore(value: 3)
+    private var gpuTimer: GPUTimer?
+    private var lastTimerReport = 0.0
+
+    /// The app is sandboxed, so it cannot write a report to an arbitrary path,
+    /// and under Launch Services it has no stdout to print to. The unified log
+    /// is reachable from both. One line per call — a multi-line message gets
+    /// truncated.
+    private static let timingLog = Logger(subsystem: "com.pcb.render", category: "gputiming")
+
+    private func emitTiming(_ text: String) {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            Renderer.timingLog.notice("\(line, privacy: .public)")
+        }
+    }
 
     /// Reused every frame so the render thread does not allocate.
     private var wantedScratch: [Int] = []
@@ -87,6 +102,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         refreshInterval = 1.0 / Double(max(view.preferredFramesPerSecond, 1))
         store = TileStore(params: params, ring: ring)
         store.beginBurst()
+        if ProcessInfo.processInfo.environment["PCB_GPU_TIMING"] != nil {
+            gpuTimer = GPUTimer(device: device, framesInFlight: 3)
+            post.timer = gpuTimer
+            let state = gpuTimer == nil ? "UNSUPPORTED" : "on"
+            Renderer.timingLog.notice("gpu timing: \(state, privacy: .public)")
+        }
         wantedScratch.reserveCapacity(64)
         readyScratch.reserveCapacity(Layout.maxCachedTiles)
 
@@ -299,6 +320,7 @@ final class Renderer: NSObject, MTKViewDelegate {
         post.resize(width: pixelW, height: pixelH)
 
         guard let command = frameQueue.makeCommandBuffer() else { inFlight.signal(); return }
+        gpuTimer?.beginFrame()
         command.addCompletedHandler { [inFlight] _ in inFlight.signal() }
         guard let enc = post.beginScene(in: command) else { return }
 
@@ -462,6 +484,18 @@ final class Renderer: NSObject, MTKViewDelegate {
         stats.beginFrame(at: CACurrentMediaTime(), readyTiles: drawn)
         command.addCompletedHandler { [weak stats] buffer in
             stats?.recordFrameGpu(buffer.gpuEndTime - buffer.gpuStartTime)
+        }
+        if let gpuTimer {
+            gpuTimer.endFrame(command)
+            let now = CACurrentMediaTime()
+            if lastTimerReport == 0 { lastTimerReport = now }
+            // Discard the first stretch: the board is still arriving and the
+            // burst lane is loaded, so the passes are not doing steady work.
+            else if now - lastTimerReport > 5, gpuTimer.frameCount > 120 {
+                emitTiming(gpuTimer.report())
+                gpuTimer.reset()
+                lastTimerReport = now
+            }
         }
         #if os(macOS)
         // When this frame actually reaches the screen, which is what the board's
